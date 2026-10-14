@@ -181,6 +181,19 @@ Permission cards show what the tool will do:
 
 The mirror also rewrites Markdown that Discord can't show. Tables become lists, headings below `###` become bold lines, and horizontal rules are dropped. Code blocks are left as they are.
 
+## The console and channels
+
+The **console** (`#claude-console`) lists every session with its status, with menus and buttons below. Three of them act on running sessions at once, so each first asks in a message only you can see; the red button goes ahead, "Cancel" changes nothing:
+
+- **Pause all**: pauses sync for every session. Claude keeps working, but nothing from the paused stretch is posted, then or after resuming; permission prompts stay in the terminal; messages sent in the channels are refused. "Resume all" brings it back and doesn't ask.
+- **Interrupt a working session**: the same as Esc in the terminal; the session stays open.
+- **End a session**: interrupts it if it's working, then types `/exit`. It can be resumed later.
+
+**Deleting a channel on Discord does not delete the Claude Code session.** The transcript lives on the computer under `~/.claude/projects/`; the channel is only a mirror. What deleting does:
+
+- The channel of a **running** session: the daemon recreates it a few seconds later with the last 15 entries. The session itself is untouched. To keep it off Discord, pause it with `/sync off` instead.
+- The channel of an **ended** session: the daemon forgets the session, and it leaves the console's resume menu. `claude --resume` on the computer still works, and resuming opens a new channel.
+
 ## Rules for messages from Discord
 
 The daemon refuses to send a message, and says why, rather than type it somewhere it doesn't belong:
