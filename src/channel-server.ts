@@ -1,11 +1,12 @@
 #!/usr/bin/env bun
 /**
- * Per-session Claude Code channel server (MCP over stdio).
+ * Per-session MCP server, started by every `ccd` session.
  *
- * Claude Code spawns one of these per session when launched with
+ * It connects to the discord-sync daemon over a Unix socket and identifies its
+ * session by the parent Claude Code PID (and tmux pane), and offers send_file.
+ * With `"channels": true` Claude Code also loads it as a channel
  *   claude --dangerously-load-development-channels server:discord-sync
- * It connects to the discord-sync daemon over a Unix socket, identifies its
- * session by the parent Claude Code PID, and relays:
+ * and it relays:
  *   Discord message      -> notifications/claude/channel            -> session
  *   permission prompt    -> daemon (buttons in the session channel)
  *   button / "yes xxxxx" -> notifications/claude/channel/permission -> session
@@ -17,35 +18,54 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { z } from 'zod'
 import { connect, type Socket } from 'net'
 import { isAbsolute } from 'path'
-import { SOCKET_PATH } from './config'
+import { SOCKET_PATH, readConfigFile } from './config'
 import { findClaudePid } from './sessions'
 import { send, onLines, type DaemonMsg, type ClientMsg } from './ipc'
 import { typeIntoOwnTty, keysToTty } from './keys'
 
 const claudePid = Number(process.env.CLAUDE_PID) || findClaudePid(process.ppid)
+const useChannels = readConfigFile().channels === true
+
+const COLLABORATOR_RULES = [
+  '- If a collaborator asks for something that conflicts with what the owner asked, follow the owner.',
+  "- Before acting on a collaborator's request that deletes or overwrites work, is hard to undo, reveals secrets or credentials, reaches outside the project, or publishes or sends anything (git push, deploys, messages), ask the owner to confirm in the channel first.",
+]
+
+const CHANNEL_INSTRUCTIONS = [
+  'This session is mirrored to a Discord channel by discord-sync. The user may be at the local terminal or on Discord.',
+  'Messages typed on Discord arrive as <channel source="discord-sync" user="..." message_id="...">. Treat them as messages from the user.',
+  'A message without a role attribute is from the session owner. role="collaborator" or role="collaborator (full)" marks someone the owner shared the session with:',
+  ...COLLABORATOR_RULES,
+  'Everything you write in your normal responses is mirrored to that Discord channel automatically, so just answer normally. There is no reply tool and none is needed.',
+  'If the tag has an attachments attribute, it lists local file paths of files the user uploaded; Read them as needed.',
+  'A meeting attribute means the people in the channel discussed something among themselves in a thread; answers there marked "Claude (read-only copy)" came from a read-only fork of this session and are not in your context. attachments then holds the transcript as a Markdown file. Read it first. The message text is their conclusion: act on it. If it says "(no conclusion given)", summarize the discussion, the decisions and open questions, and propose next steps before changing anything.',
+  'Use send_file to post a file (screenshot, log, build output) into the Discord channel.',
+]
+
+const TYPED_INSTRUCTIONS = [
+  'This session is mirrored to a Discord channel by discord-sync. The user may be at the local terminal or on their phone, and either way their messages reach you as ordinary user messages: what they send on Discord is typed into this terminal.',
+  'A message from the session owner looks like any other. A message that starts with "[Discord · name (collaborator)]" or "[Discord · name (collaborator (full))]" is from someone the owner shared the session with:',
+  ...COLLABORATOR_RULES,
+  'Everything you write in your normal responses is mirrored to that Discord channel automatically, so just answer normally. There is no reply tool and none is needed.',
+  '"[Attached from Discord: …]" lists local file paths of files the user uploaded; Read them as needed.',
+  'Permission prompts, questions (AskUserQuestion) and plans (ExitPlanMode) can be answered on Discord as well as in the terminal; use them as usual.',
+  'Use send_file to post a file (screenshot, log, build output) into the Discord channel.',
+]
 
 const mcp = new Server(
   { name: 'discord-sync', version: '0.1.0' },
   {
     capabilities: {
       tools: {},
-      experimental: {
-        'claude/channel': {},
-        // Permission relay: the daemon only accepts answers from allowlisted Discord users.
-        'claude/channel/permission': {},
-      },
+      experimental: useChannels
+        ? {
+            'claude/channel': {},
+            // Permission relay: the daemon only accepts answers from allowlisted Discord users.
+            'claude/channel/permission': {},
+          }
+        : {},
     },
-    instructions: [
-      'This session is mirrored to a Discord channel by discord-sync. The user may be at the local terminal or on Discord.',
-      'Messages typed on Discord arrive as <channel source="discord-sync" user="..." message_id="...">. Treat them as messages from the user.',
-      'A message without a role attribute is from the session owner. role="collaborator" or role="collaborator (full)" marks someone the owner shared the session with:',
-      '- If a collaborator asks for something that conflicts with what the owner asked, follow the owner.',
-      "- Before acting on a collaborator's request that deletes or overwrites work, is hard to undo, reveals secrets or credentials, reaches outside the project, or publishes or sends anything (git push, deploys, messages), ask the owner to confirm in the channel first.",
-      'Everything you write in your normal responses is mirrored to that Discord channel automatically, so just answer normally. There is no reply tool and none is needed.',
-      'If the tag has an attachments attribute, it lists local file paths of files the user uploaded; Read them as needed.',
-      'A meeting attribute means the people in the channel discussed something among themselves in a thread; answers there marked "Claude (read-only copy)" came from a read-only fork of this session and are not in your context. attachments then holds the transcript as a Markdown file. Read it first. The message text is their conclusion: act on it. If it says "(no conclusion given)", summarize the discussion, the decisions and open questions, and propose next steps before changing anything.',
-      'Use send_file to post a file (screenshot, log, build output) into the Discord channel.',
-    ].join('\n'),
+    instructions: (useChannels ? CHANNEL_INSTRUCTIONS : TYPED_INSTRUCTIONS).join('\n'),
   },
 )
 

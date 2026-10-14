@@ -34,7 +34,7 @@ const OFFICIAL_DIR = join(CLAUDE_DIR, 'channels', 'discord')
 
 export type Config = {
   token: string
-  /** Language of the Discord-facing text: "en" (default) or "zh-TW". */
+  /** Language of the Discord-facing text: "en" (default), "zh-TW" or "zh-CN". */
   language: Language
   /** Guild to create channels in. Auto-detected when the bot is in exactly one guild. */
   guildId?: string
@@ -59,6 +59,18 @@ export type Config = {
   consoleChannelName: string
   /** Delete ended sessions' channels this many days after they ended. Unset or 0: keep them until the server nears 500 channels. */
   deleteEndedAfterDays?: number
+  /**
+   * Load ccd sessions as a Claude Code channel (research preview: needs a claude.ai or Console
+   * login, not a third-party API gateway). Off (default): Discord messages are typed into the
+   * session's tmux pane and prompts go through a PermissionRequest hook, which works with any login.
+   */
+  channels: boolean
+  /**
+   * Which sessions running in tmux take Discord messages as typed input:
+   * "all" (default; plain `claude` too), "ccd" (only sessions started with ccd; the default with
+   * `"channels": true`), "off".
+   */
+  tmuxInput: 'all' | 'ccd' | 'off'
 }
 
 function readEnvFile(path: string): Record<string, string> {
@@ -123,5 +135,8 @@ export function loadConfig(): Config {
     attachOver: file.attachOver ?? 3800,
     consoleChannelName: file.consoleChannelName ?? m.consoleChannelName,
     deleteEndedAfterDays: file.deleteEndedAfterDays,
+    channels: file.channels ?? false,
+    // With channels, plain `claude` sessions stay read-only unless asked for, as before.
+    tmuxInput: file.tmuxInput === 'all' || file.tmuxInput === 'ccd' || file.tmuxInput === 'off' ? file.tmuxInput : file.channels ? 'ccd' : 'all',
   }
 }

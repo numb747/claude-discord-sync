@@ -5,7 +5,7 @@
  *   claude-discord-sync setup | update | uninstall | doctor | daemon [--log <file>] | ccd [claude args…]
  *
  * Internal subcommands (started by Claude Code or the daemon):
- *   channel, ask-hook, stop-hook, statusline, win-console
+ *   channel, ask-hook, perm-hook, stop-hook, statusline, win-console
  */
 import { appendFileSync } from 'fs'
 import { format } from 'util'
@@ -22,6 +22,7 @@ const COMMANDS: Record<string, () => Promise<unknown>> = {
   ccd: () => import('./ccd'),
   channel: () => import('./channel-server'),
   'ask-hook': () => import('./ask-hook'),
+  'perm-hook': () => import('./perm-hook'),
   'stop-hook': () => import('./stop-hook'),
   statusline: () => import('./statusline').then(s => s.run()),
   'win-console': () => import('./win-console'),
@@ -38,7 +39,7 @@ if (!load) {
 
 Usage:
   claude-discord-sync setup         set up the bot, config and autostart (interactive)
-  claude-discord-sync ccd [args…]   start Claude Code with the Discord channel (same as \`ccd\`)
+  claude-discord-sync ccd [args…]   start Claude Code with the Discord hooks (same as \`ccd\`)
   claude-discord-sync doctor        check the bot, permissions and sessions (read-only)
   claude-discord-sync pause [all]   pause mirroring: this session when run inside one (e.g. \`! claude-discord-sync pause\`), else all
   claude-discord-sync unpause [all] resume mirroring

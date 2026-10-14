@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Launch Claude Code with the discord-sync channel and hooks loaded, so the
-# session can be driven from Discord. All arguments are passed through to
-# `claude`. The config (MCP server, hooks) comes from src/ccd.ts; exec keeps
-# Claude Code on this shell's PID, which /new relies on to find tmux sessions.
+# Launch Claude Code with the discord-sync hooks (and the channel, if enabled in
+# config.json) loaded, so the session can be driven from Discord. All arguments
+# are passed through to `claude`. The config (MCP server, hooks) comes from
+# src/ccd.ts; exec keeps Claude Code on this shell's PID, which /new relies on to
+# find tmux sessions.
 # Resolve symlinks portably (macOS before 12.3 has no `readlink -f`).
 SRC="$0"
 while [ -L "$SRC" ]; do
@@ -10,6 +11,8 @@ while [ -L "$SRC" ]; do
   case "$LINK" in /*) SRC="$LINK" ;; *) SRC="$(dirname "$SRC")/$LINK" ;; esac
 done
 DIR="$(cd "$(dirname "$SRC")/.." && pwd)"
-CFG="$(bun "$DIR/src/ccd.ts" --write-config)" || exit 1
-exec claude --mcp-config "$CFG/mcp.json" --settings "$CFG/settings.json" \
-  --dangerously-load-development-channels server:discord-sync "$@"
+OUT="$(bun "$DIR/src/ccd.ts" --write-config)" || exit 1
+CFG="${OUT%%$'\n'*}"
+CHANNEL=()
+case "$OUT" in *$'\n'channels) CHANNEL=(--dangerously-load-development-channels server:discord-sync) ;; esac
+exec claude --mcp-config "$CFG/mcp.json" --settings "$CFG/settings.json" "${CHANNEL[@]}" "$@"

@@ -10,10 +10,16 @@ export type ClientMsg =
   | { t: 'type_result'; ok: boolean; error?: string }
   /** From `claude-discord-sync pause|unpause` (own connection): one session (by Claude Code PID) or all. */
   | { t: 'pause'; paused: boolean; pid?: number }
-  /** From ask-hook.ts (its own connection, no hello): AskUserQuestion to answer on Discord. */
-  | { t: 'ask'; sessionId: string; questions: AskQuestion[] }
-  /** From ask-hook.ts: ExitPlanMode plan to approve or send back on Discord. */
-  | { t: 'plan'; sessionId: string; plan: string }
+  /**
+   * From ask-hook.ts or perm-hook.ts (own connection, no hello): AskUserQuestion to answer on Discord.
+   * race: Claude Code shows the same dialog in the terminal meanwhile (PermissionRequest hook),
+   * so whichever side answers first wins and the daemon retires the menus once the terminal moves on.
+   */
+  | { t: 'ask'; sessionId: string; questions: AskQuestion[]; race?: boolean }
+  /** ExitPlanMode plan to approve or send back on Discord. With race, approving presses the terminal's option. */
+  | { t: 'plan'; sessionId: string; plan: string; race?: boolean }
+  /** From perm-hook.ts: a tool permission prompt, shown in the terminal at the same time. */
+  | { t: 'perm'; sessionId: string; toolName: string; toolInput: Record<string, unknown>; suggestions?: unknown[] }
 
 export type AskQuestion = {
   question: string
@@ -21,6 +27,10 @@ export type AskQuestion = {
   multiSelect?: boolean
   options: { label: string; description?: string }[]
 }
+
+export type PermDecision =
+  | { behavior: 'allow'; updatedInput?: Record<string, unknown>; updatedPermissions?: unknown[] }
+  | { behavior: 'deny'; message?: string; interrupt?: boolean }
 
 /** Messages from the daemon to a channel server. */
 export type DaemonMsg =
@@ -30,6 +40,8 @@ export type DaemonMsg =
   /** question text -> answer; undefined = answer in the local terminal instead. */
   | { t: 'ask_result'; answers?: Record<string, string> }
   | { t: 'plan_result'; approved: boolean; feedback?: string }
+  /** Answer to `perm`, in the PermissionRequest hook's decision format; undefined = leave it to the terminal. */
+  | { t: 'perm_result'; decision?: PermDecision }
   /** /stop, /end: type keys into the session's terminal. */
   | { t: 'type'; keys: Key[] }
   | { t: 'pause_result'; text: string }

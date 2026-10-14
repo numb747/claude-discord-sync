@@ -5,14 +5,18 @@
  */
 import { connect } from 'net'
 import { SOCKET_PATH, readConfigFile } from './config'
+import { pickLanguage } from './i18n'
 import { findClaudePid } from './sessions'
 import { send, onLines, type DaemonMsg } from './ipc'
 
 export async function run(paused: boolean) {
   const all = process.argv.slice(2).some(a => a === 'all' || a === '--all')
   const pid = all ? undefined : findClaudePid(process.ppid)
-  const notRunning =
-    readConfigFile().language === 'zh-TW' ? 'daemon 沒有在執行，請先啟動它。' : 'The daemon is not running; start it first.'
+  const notRunning = {
+    en: 'The daemon is not running; start it first.',
+    'zh-TW': 'daemon 沒有在執行，請先啟動它。',
+    'zh-CN': 'daemon 没有在运行，请先启动它。',
+  }[pickLanguage(readConfigFile().language)]
   const text = await new Promise<string | undefined>(resolve => {
     const sock = connect(SOCKET_PATH)
     sock.on('connect', () => send(sock, { t: 'pause', paused, ...(pid ? { pid } : {}) }))

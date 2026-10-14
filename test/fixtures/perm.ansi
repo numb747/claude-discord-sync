@@ -1,0 +1,44 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.273[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mHaiku 4.5 · API Usage Billing[39m
+[38;5;174m  ▝▝ ▝▝  [39m  [38;5;246m~/project[39m
+
+
+[38;5;239m[48;5;237m❯[39m [38;5;231m/clear[39m
+[49m
+[38;5;239m[48;5;237m❯ [38;5;231mRun this exact bash command: curl -sI https://example.com/fx -o /dev/null -w "%{http_code}"[39m
+
+[38;5;246m[49m [39m Thinking for [1m8s[0m, running [1m1[0m shell command…
+[38;5;246m  ⎿  $ curl -sI https://example.com/fx -o /dev/null -w "%{http_code}"[39m
+
+[38;5;153m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m [1m[38;5;153mBash command[0m
+
+   curl -sI https://example.com/fx -o /dev/null -w "%{http_code}"
+   [38;5;246mCheck HTTP status code for example.com/fx[39m
+
+ This command requires approval
+
+ Do you want to proceed?
+ [38;5;153m❯[39m [38;5;246m1. [38;5;153mYes[39m
+   [38;5;246m2. [39mYes, and don’t ask again for: curl *
+   [38;5;246m3. [39mNo
+
+ [38;5;246mEsc to cancel · Tab to amend[39m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

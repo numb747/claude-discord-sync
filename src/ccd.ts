@@ -1,15 +1,16 @@
 #!/usr/bin/env bun
 /**
- * Launch Claude Code with the discord-sync channel and hooks.
+ * Launch Claude Code with the discord-sync hooks (and, with `"channels": true`, the channel).
  *
  *   ccd [claude args…]                 spawn claude with the config below
- *   ccd --write-config                 write the config files and print their folder
+ *   ccd --write-config                 write the config files and print their folder, plus a
+ *                                      line "channels" when the channel should be loaded
  *                                      (the source checkout's bin/ccd uses this, then execs
  *                                      claude itself so Claude Code keeps the shell's PID)
  */
 import { mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
-import { CLAUDE_DIR, STATE_DIR } from './config'
+import { CLAUDE_DIR, STATE_DIR, readConfigFile } from './config'
 import { USER_STATUSLINE_FILE } from './statusline'
 import { IS_WIN } from './platform'
 import { selfCommand } from './self'
@@ -33,6 +34,13 @@ function userStatusLine(): { command?: string; padding?: number } {
   }
 }
 
+/**
+ * Without channels, prompts reach Discord through a PermissionRequest hook. Claude Code keeps its
+ * own dialog on screen while the hook waits, so the terminal is never blocked; the daemon ends the
+ * hook once the dialog is answered there. This only caps how long a Discord card stays answerable.
+ */
+const PERM_HOOK_TIMEOUT = 24 * 3600
+
 function writeConfig(): string {
   const dir = join(STATE_DIR, 'ccd')
   mkdirSync(dir, { recursive: true })
@@ -40,21 +48,29 @@ function writeConfig(): string {
   writeFileSync(USER_STATUSLINE_FILE, user.command ?? '')
   const [command, ...args] = selfCommand('channel').map(slash)
   writeFileSync(join(dir, 'mcp.json'), JSON.stringify({ mcpServers: { 'discord-sync': { command, args } } }, null, 2))
+  const stopHook = { matcher: '*', hooks: [{ type: 'command', command: hook('stop-hook') }] }
+  const hooks = useChannels
+    ? {
+        // The channel relays permission prompts itself; questions and plans wait on Discord before the dialog.
+        PreToolUse: [
+          {
+            matcher: 'AskUserQuestion|ExitPlanMode',
+            hooks: [{ type: 'command', command: hook('ask-hook'), timeout: askTimeout + 30 }],
+          },
+          stopHook,
+        ],
+      }
+    : {
+        PreToolUse: [stopHook],
+        PermissionRequest: [{ matcher: '*', hooks: [{ type: 'command', command: hook('perm-hook'), timeout: PERM_HOOK_TIMEOUT }] }],
+      }
   writeFileSync(
     join(dir, 'settings.json'),
     JSON.stringify(
       {
         // Our status line keeps Claude Code's usage snapshot for the daemon, then shows the user's own.
         statusLine: { type: 'command', command: hook('statusline'), ...(user.padding !== undefined ? { padding: user.padding } : {}) },
-        hooks: {
-          PreToolUse: [
-            {
-              matcher: 'AskUserQuestion|ExitPlanMode',
-              hooks: [{ type: 'command', command: hook('ask-hook'), timeout: askTimeout + 30 }],
-            },
-            { matcher: '*', hooks: [{ type: 'command', command: hook('stop-hook') }] },
-          ],
-        },
+        hooks,
       },
       null,
       2,
@@ -63,16 +79,20 @@ function writeConfig(): string {
   return dir
 }
 
+/** `"channels": true` in config.json; read here without loadConfig(), which needs the bot token. */
+const useChannels = readConfigFile().channels === true
+
 const dir = writeConfig()
 if (process.argv[2] === '--write-config') {
-  process.stdout.write(dir)
+  // A second line tells bin/ccd to load the channel too.
+  process.stdout.write(useChannels ? `${dir}\nchannels` : dir)
   process.exit(0)
 }
 
 const args = [
   '--mcp-config', join(dir, 'mcp.json'),
   '--settings', join(dir, 'settings.json'),
-  '--dangerously-load-development-channels', 'server:discord-sync',
+  ...(useChannels ? ['--dangerously-load-development-channels', 'server:discord-sync'] : []),
   ...process.argv.slice(2),
 ]
 const claude = Bun.which('claude')

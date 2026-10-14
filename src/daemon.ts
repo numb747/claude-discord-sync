@@ -43,10 +43,10 @@ import { promisify } from 'util'
 import { homedir, hostname } from 'os'
 import { readFileSync, writeFileSync, appendFileSync, renameSync, rmSync, mkdirSync, chmodSync, statSync, readdirSync, openSync, readSync, closeSync } from 'fs'
 import { basename, dirname, join, resolve } from 'path'
-import { loadConfig, readConfigFile, STATE_DIR, SOCKET_PATH, HOST_ID, otherClaim } from './config'
+import { loadConfig, readConfigFile, STATE_DIR, SOCKET_PATH, HOST_ID, CLAIM_RE, otherClaim } from './config'
 import { scanSessions, findTranscript, isAlive, JsonlTail, type LiveSession } from './sessions'
 import { renderRecord, titleOf, toolLabel, pack, chunk, type Block, type RenderContext, type Post } from './render'
-import { send as ipcSend, onLines, type ClientMsg, type AskQuestion } from './ipc'
+import { send as ipcSend, onLines, type ClientMsg, type AskQuestion, type PermDecision } from './ipc'
 import { m, SLASH_DESCRIPTIONS } from './i18n'
 import { meetingHtml, type HtmlLabels } from './meeting-html'
 import { readSnapshot, tokens, type PlanLimit } from './usage'
@@ -54,6 +54,7 @@ import { IS_WIN, IS_LINUX, hasTmux, parentPid } from './platform'
 import { COMPILED, selfCommand } from './self'
 import { daemonRunning } from './autostart'
 import { keysToTmux, type Key } from './keys'
+import { capture, dialogOptions, leaveCopyMode, parseKeys, pasteAndSubmit, promptOf, screenTail, tmux, type DialogOption, type Pane } from './terminal'
 
 const cfg = loadConfig()
 /** Experimental: several computers share this bot and guild; this one's name. */
@@ -201,6 +202,12 @@ type Tracked = {
   statusUpdating?: boolean
   /** Context size from the transcript's last reply, for sessions without a status line snapshot. */
   ctxTokens?: number
+  /** Since when the session has been waiting on a terminal dialog, for the dialog snapshot. */
+  waitingSince?: number
+  /** Messages typed in from Discord, so their echo in the transcript isn't posted back as local input. */
+  typed?: { text: string; at: number }[]
+  /** A dialog was just answered from Discord: no screen card until then, while the terminal catches up. */
+  quietUntil?: number
 }
 const tracked = new Map<string, Tracked>()
 const creating = new Set<string>()
@@ -327,13 +334,25 @@ function topicFor(sessionId: string, st: SessionState): string {
 
 function headerFor(t: Tracked): string {
   const s = t.live!
-  const interactive = peers.has(s.pid)
+  const route = inputRoute(t)
   return [
     m.syncStarted,
     `📂 \`${s.cwd}\``,
     `🆔 \`${s.sessionId}\` · PID ${s.pid}`,
-    interactive ? m.twoWay : m.readOnly,
+    route === 'channel' ? m.twoWay : route === 'tmux' ? (peers.has(s.pid) ? m.twoWayTmux : m.twoWayTmuxPlain) : cfg.channels ? m.readOnly : m.readOnlyNoTmux,
   ].join('\n')
+}
+
+/**
+ * How Discord messages reach a session: through the channel (`"channels": true`
+ * and started with ccd), typed into its tmux pane, or not at all (read-only).
+ */
+function inputRoute(t: Tracked): 'channel' | 'tmux' | undefined {
+  const pid = t.live?.pid
+  if (!pid) return undefined
+  if (cfg.channels && peers.has(pid)) return 'channel'
+  if (cfg.tmuxInput === 'off' || (cfg.tmuxInput === 'ccd' && !peers.has(pid))) return undefined
+  return tmuxPaneOf(pid) ? 'tmux' : undefined
 }
 
 // ---- session lifecycle ---------------------------------------------------
@@ -404,6 +423,8 @@ async function startTracking(s: LiveSession) {
 }
 
 async function endTracking(t: Tracked) {
+  const card = dialogs.get(t.sessionId)
+  if (card) closeDialogCard(t.sessionId, card, m.dialogClosed)
   pump(t)
   // Nobody can hand an open meeting to an ended session; keep its record.
   await closeMeeting(t, { handoff: false })
@@ -546,7 +567,7 @@ function pump(t: Tracked) {
     trackActivity(t, o)
     noteTitle(t.st, o)
     noteContext(t, o)
-    blocks.push(...renderRecord(o, t.ctx))
+    blocks.push(...renderRecord(o, t.ctx).filter(b => !(b.kind === 'user' && b.plain && wasTyped(t, b.plain))))
   }
   t.st.offset = t.tail.offset
   stateDirty = true
@@ -655,7 +676,7 @@ function notifyWhenDone(t: Tracked) {
   t.busySince = undefined
   if (cfg.notifyMinBusySec < 0 || elapsed < cfg.notifyMinBusySec * 1000 || !cfg.allowFrom.length || isPaused(t.st)) return
   // A pending question already pinged them.
-  if ([...asks.values(), ...plans.values()].some(a => a.channelId === t.st.channelId)) return
+  if ([...asks.values(), ...plans.values(), ...perms.values()].some(a => a.channelId === t.st.channelId)) return
   const who = audience(t.st, 'chat')
   void channelOf(t).then(ch => {
     if (!ch) return
@@ -696,6 +717,8 @@ async function tick() {
       void syncChannel(t.sessionId, t.st)
       warnContext(t)
       notifyWhenDone(t)
+      retireAnswered(t)
+      watchDialog(t)
       updateStatus(t)
       remindIdleMeeting(t)
       // Typing indicator while Claude is working (lasts ~10s per call).
@@ -754,7 +777,7 @@ async function downloadAttachments(msg: Message): Promise<string[]> {
 
 client.on('messageCreate', async (msg: Message) => {
   if (msg.author.bot || msg.guildId !== guild?.id) return
-  const cmd = /^!(new|stop|end|resume|sync|model|mode|rename|handoff)(?:\s+([\s\S]*))?$/i.exec(msg.content.trim())
+  const cmd = /^!(new|stop|end|resume|sync|model|mode|rename|handoff|screen|key)(?:\s+([\s\S]*))?$/i.exec(msg.content.trim())
   if (cmd) {
     const name = cmd[1].toLowerCase()
     if (!can(msg.author.id, sessionByChannel(msg.channelId), name === 'stop' || name === 'rename' || name === 'handoff' ? 'chat' : 'owner')) {
@@ -777,6 +800,8 @@ client.on('messageCreate', async (msg: Message) => {
       await makeHandoff(messageReplier(msg), msg.channelId, (cmd[2] ?? '').trim() || undefined)
       return
     }
+    if (name === 'screen') return void (await showScreen(messageReplier(msg), msg.channelId).catch(e => void msg.reply(m.failed(String(e?.message ?? e)))))
+    if (name === 'key') return void (await pressKeys(messageReplier(msg), msg.channelId, cmd[2] ?? '').catch(e => void msg.reply(m.failed(String(e?.message ?? e)))))
     if (name === 'rename') {
       const title = (cmd[2] ?? '').trim()
       if (!title) return void (await msg.reply(m.renameUsage))
@@ -802,22 +827,23 @@ client.on('messageCreate', async (msg: Message) => {
     return
   }
   const peer = t.live ? peers.get(t.live.pid) : undefined
-  if (!peer) {
-    void msg
-      .reply(m.readOnlyReply)
-      .catch(() => {})
-    return
-  }
   // Permission answers work in any mode, meetings included.
   const perm = PERMISSION_REPLY_RE.exec(msg.content)
-  if (perm) {
+  if (perm && (perms.has(perm[2].toLowerCase()) || (cfg.channels && peer))) {
     if (!can(msg.author.id, t.st, 'approve')) {
       void msg.react('🚫').catch(() => {})
       return
     }
     const behavior = perm[1].toLowerCase().startsWith('y') ? 'allow' : 'deny'
-    ipcSend(peer, { t: 'permission', request_id: perm[2].toLowerCase(), behavior })
+    const id = perm[2].toLowerCase()
+    if (perms.has(id)) await settlePerm(id, behavior, msg.author.username)
+    else ipcSend(peer!, { t: 'permission', request_id: id, behavior })
     void msg.react(behavior === 'allow' ? '✅' : '❌').catch(() => {})
+    return
+  }
+  const route = inputRoute(t)
+  if (!route) {
+    void msg.reply(cfg.channels ? m.readOnlyReply : m.readOnlyReplyNoTmux).catch(() => {})
     return
   }
   // @-mentioning people (but not the bot) opens a meeting thread.
@@ -832,25 +858,103 @@ client.on('messageCreate', async (msg: Message) => {
     void msg.reply(m.pausedReply).catch(() => {})
     return
   }
+  // "!" starts Claude Code's shell mode; here it's far more likely a mistyped bot command.
+  if (route === 'tmux' && /^\s*!/.test(msg.content)) {
+    void msg.reply(m.unknownBang).catch(() => {})
+    return
+  }
   const files = await downloadAttachments(msg).catch(() => [] as string[])
+  if (!msg.content.trim() && !files.length) return
   if (msg.content.trim()) {
     t.st.lastPrompt = msg.content.replace(/\s+/g, ' ').slice(0, 200)
     stateDirty = true
   }
-  ipcSend(peer, {
+  const role = isOwner(msg.author.id) ? undefined : roleTag(msg.author.id, t.st)
+  if (route === 'tmux') {
+    const { error } = await typeMessage(t, typedText(msg.content, files, role ? { user: msg.author.username, role } : undefined))
+    if (error) void msg.reply(m.cantDeliver(error)).catch(() => {})
+    else void msg.react('📨').catch(() => {})
+    return
+  }
+  ipcSend(peer!, {
     t: 'message',
     content: msg.content || (files.length ? '(attachment)' : ''),
     meta: {
       message_id: msg.id,
       user: msg.author.username,
       // Lets Claude tell the owner from someone they shared the session with.
-      ...(isOwner(msg.author.id) ? {} : { role: roleTag(msg.author.id, t.st) }),
+      ...(role ? { role } : {}),
       ts: msg.createdAt.toISOString(),
       ...(files.length ? { attachments: files.join('; ') } : {}),
     },
   })
   void msg.react('📨').catch(() => {})
 })
+
+// ---- Discord -> session without channels: typed into the tmux pane ---------
+
+/**
+ * A Discord message as typed into the session. Without a channel there is no
+ * metadata, so attachments and who wrote it (when not the owner) go in the text.
+ * The tag in front also keeps a collaborator's message from starting with `!`
+ * (Claude Code's shell mode) or `/` (a command).
+ */
+function typedText(content: string, files: string[], from?: { user: string; role: string }): string {
+  let text = content.trim()
+  if (files.length) text += `${text ? '\n\n' : ''}[Attached from Discord: ${files.join(', ')}]`
+  return from ? `[Discord · ${from.user} (${from.role})] ${text}` : text
+}
+
+const TYPED_KEEP_MS = 10 * 60_000
+const sameText = (s: string) => s.replace(/\s+/g, ' ').trim()
+
+/** Whether a prompt in the transcript is one we typed in from Discord (each counts once). */
+function wasTyped(t: Tracked, plain: string): boolean {
+  t.typed = (t.typed ?? []).filter(x => Date.now() - x.at < TYPED_KEEP_MS)
+  const i = t.typed.findIndex(x => x.text === sameText(plain))
+  if (i < 0) return false
+  t.typed.splice(i, 1)
+  return true
+}
+
+/** One paste at a time per pane, so two quick messages can't interleave. */
+const typing = new Map<string, Promise<unknown>>()
+
+/**
+ * Paste `text` at the session's prompt and press Enter. Refused (with the reason)
+ * while Claude Code shows a dialog or menu instead of its input line, or when
+ * something typed locally is waiting there, so nothing lands where it shouldn't.
+ * While Claude works, Claude Code queues the message for after the current turn.
+ */
+function typeMessage(t: Tracked, text: string): Promise<{ error?: string }> {
+  const pane = t.live && tmuxPaneOf(t.live.pid)
+  if (!pane) return Promise.resolve({ error: m.noWayToType })
+  const key = `${pane.socket} ${pane.pane}`
+  const next = (typing.get(key) ?? Promise.resolve()).then(async (): Promise<{ error?: string }> => {
+    if (t.live?.status === 'waiting') return { error: m.sessionWaiting }
+    await leaveCopyMode(pane)
+    // Right after a dialog closes, the input line takes a moment to come back.
+    let prompt = promptOf(await capture(pane, true))
+    for (let i = 0; !prompt && i < 6; i++) {
+      await Bun.sleep(500)
+      prompt = promptOf(await capture(pane, true))
+    }
+    if (!prompt) return { error: m.noPromptLine }
+    if (prompt.draft) return { error: m.draftInTerminal(clip(prompt.draft, 80)) }
+    const entry = { text: sameText(text), at: Date.now() }
+    ;(t.typed ??= []).push(entry)
+    try {
+      await pasteAndSubmit(pane, text)
+    } catch (e) {
+      t.typed = t.typed.filter(x => x !== entry)
+      throw e
+    }
+    return {}
+  })
+  const settled = next.catch(e => ({ error: String(e?.message ?? e) }))
+  typing.set(key, settled)
+  return settled
+}
 
 client.on('interactionCreate', async (i: Interaction) => {
   // One bot can serve several computers, each in its own guild: only this guild's interactions are ours.
@@ -908,6 +1012,14 @@ client.on('interactionCreate', async (i: Interaction) => {
     await handlePlanInteraction(i).catch(e => log('plan interaction failed:', e?.message ?? e))
     return
   }
+  if ((i.isButton() || i.isModalSubmit()) && /^ph(:|tell:)/.test(i.customId)) {
+    await handlePermInteraction(i).catch(e => log('permission interaction failed:', e?.message ?? e))
+    return
+  }
+  if (i.isButton() && i.customId.startsWith('dlg:')) {
+    await handleDialogButton(i).catch(e => log('dialog button failed:', e?.message ?? e))
+    return
+  }
   if (!i.isButton()) return
   const match = /^perm:(allow|deny):(\d+):([a-km-z]{5})$/.exec(i.customId)
   if (!match) return
@@ -941,6 +1053,8 @@ const asks = new Map<string, PendingAsk>()
 const OTHER = 'other'
 
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + '…' : s)
+/** Keep the end: a screen's dialog is at the bottom. */
+const clipStart = (s: string, n: number) => (s.length > n ? '…' + s.slice(-(n - 1)) : s)
 
 function askContent(a: PendingAsk, footer?: string): string {
   const n = a.questions.length
@@ -976,7 +1090,7 @@ function askComponents(key: string, a: PendingAsk) {
   return rows.slice(0, 5)
 }
 
-async function startAsk(sock: Socket, sessionId: string, questions: AskQuestion[]) {
+async function startAsk(sock: Socket, sessionId: string, questions: AskQuestion[], racing = false) {
   const t = tracked.get(sessionId)
   const ch = t && (await channelOf(t))
   // Discord allows 5 component rows: up to 4 questions + the terminal button. Paused: answer locally.
@@ -991,9 +1105,15 @@ async function startAsk(sock: Socket, sessionId: string, questions: AskQuestion[
     // Hook timed out or Claude Code moved on: retire the menus.
     if (asks.get(key) !== a) return
     asks.delete(key)
+    // Racing, the hook only goes away early because the terminal took the dialog (Esc ends it).
     if (a.messageId)
-      void ch.messages.edit(a.messageId, { content: askContent(a, m.timedOut), components: [] }).catch(() => {})
+      void ch.messages.edit(a.messageId, { content: askContent(a, racing ? m.handledInTerminal : m.timedOut), components: [] }).catch(() => {})
   })
+  if (racing)
+    race(sock, sessionId, () => {
+      asks.delete(key)
+      if (a.messageId) void ch.messages.edit(a.messageId, { content: askContent(a, m.handledInTerminal), components: [] }).catch(() => {})
+    })
   const who = audience(t.st, 'chat')
   const sent = await enqueue(ch.id, () =>
     ch.send({
@@ -1022,6 +1142,7 @@ async function handleAskInteraction(i: ButtonInteraction | StringSelectMenuInter
     i.isModalSubmit() ? (i.isFromMessage() ? i.update(opts) : i.reply(opts)) : i.update(opts)
   const settle = (answers: Record<string, string> | undefined, footer: string) => {
     asks.delete(key)
+    answeredRemotely(a.sock)
     ipcSend(a.sock, { t: 'ask_result', answers })
     return update({ content: askContent(a, footer), components: [] })
   }
@@ -1070,10 +1191,11 @@ async function handleAskInteraction(i: ButtonInteraction | StringSelectMenuInter
 
 // ---- ExitPlanMode on Discord ----------------------------------------------
 
-type PendingPlan = { sock: Socket; channelId: string; messageId?: string; content: string }
+/** racing: also shown in the terminal (perm-hook.ts); approving then presses the terminal dialog's option. */
+type PendingPlan = { sock: Socket; sessionId: string; channelId: string; messageId?: string; content: string; racing: boolean }
 const plans = new Map<string, PendingPlan>()
 
-async function startPlan(sock: Socket, sessionId: string, plan: string) {
+async function startPlan(sock: Socket, sessionId: string, plan: string, racing = false) {
   const t = tracked.get(sessionId)
   const ch = t && (await channelOf(t))
   if (!ch || isPaused(t.st)) {
@@ -1085,17 +1207,32 @@ async function startPlan(sock: Socket, sessionId: string, plan: string) {
   const full = `${m.planPending}\n${plan}`
   // Long plans: preview in the message, full text attached.
   const long = full.length > 1800
-  const p: PendingPlan = { sock, channelId: ch.id, content: long ? chunk(full, 1700)[0] + '\n' + m.planAttached : full }
+  const p: PendingPlan = { sock, sessionId, channelId: ch.id, content: long ? chunk(full, 1700)[0] + '\n' + m.planAttached : full, racing }
   plans.set(key, p)
   sock.on('close', () => {
     if (plans.get(key) !== p) return
     plans.delete(key)
-    if (p.messageId) void ch.messages.edit(p.messageId, { content: `${p.content}\n\n${m.timedOut}`, components: [] }).catch(() => {})
+    const footer = racing ? m.handledInTerminal : m.timedOut
+    if (p.messageId) void ch.messages.edit(p.messageId, { content: `${p.content}\n\n${footer}`, components: [] }).catch(() => {})
   })
+  if (racing)
+    race(sock, sessionId, () => {
+      plans.delete(key)
+      if (p.messageId) void ch.messages.edit(p.messageId, { content: `${p.content}\n\n${m.handledInTerminal}`, components: [] }).catch(() => {})
+    })
+  // Racing: the terminal shows the dialog anyway, and it offers both ways of approving.
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`plan:approve:${key}`).setLabel(m.approve).setEmoji('✅').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(`plan:revise:${key}`).setLabel(m.revise).setEmoji('✏️').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`plan:term:${key}`).setLabel(m.answerInTerminal).setEmoji('⌨️').setStyle(ButtonStyle.Secondary),
+    ...(racing
+      ? [
+          new ButtonBuilder().setCustomId(`plan:approve:${key}`).setLabel(m.approveAutoEdits).setEmoji('✅').setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId(`plan:approvem:${key}`).setLabel(m.approveManualEdits).setEmoji('☑️').setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId(`plan:revise:${key}`).setLabel(m.revise).setEmoji('✏️').setStyle(ButtonStyle.Primary),
+        ]
+      : [
+          new ButtonBuilder().setCustomId(`plan:approve:${key}`).setLabel(m.approve).setEmoji('✅').setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId(`plan:revise:${key}`).setLabel(m.revise).setEmoji('✏️').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId(`plan:term:${key}`).setLabel(m.answerInTerminal).setEmoji('⌨️').setStyle(ButtonStyle.Secondary),
+        ]),
   )
   const sent = await enqueue(ch.id, () =>
     ch.send({
@@ -1109,7 +1246,7 @@ async function startPlan(sock: Socket, sessionId: string, plan: string) {
 }
 
 async function handlePlanInteraction(i: ButtonInteraction | ModalSubmitInteraction) {
-  const match = /^plan(?::(approve|revise|term)|fb):(\w+)$/.exec(i.customId)
+  const match = /^plan(?::(approve|approvem|revise|term)|fb):(\w+)$/.exec(i.customId)
   if (!match) return
   const [, action, key] = match
   const p = plans.get(key)
@@ -1135,9 +1272,17 @@ async function handlePlanInteraction(i: ButtonInteraction | ModalSubmitInteracti
     )
     return
   }
+  if ((action === 'approve' || action === 'approvem') && p.racing) {
+    // Claude Code ignores a hook's "allow" for plans: press the option in the terminal dialog instead.
+    const t = tracked.get(p.sessionId)
+    const want = action === 'approvem' ? /manual/i : /auto-accept/i
+    const r = t ? await pressOption(t, opts => opts.find(o => want.test(o.label)) ?? opts.find(o => /^yes/i.test(o.label))) : { error: m.sessionNotFound }
+    if (r.error) return void (await i.reply({ content: m.cantApproveRemotely(r.error), ephemeral: true }))
+  }
   plans.delete(key)
+  answeredRemotely(p.sock)
   let footer: string
-  if (action === 'approve') {
+  if (action === 'approve' || action === 'approvem') {
     ipcSend(p.sock, { t: 'plan_result', approved: true })
     footer = m.approvedBy(i.user.username)
   } else if (action === 'term') {
@@ -1154,6 +1299,337 @@ async function handlePlanInteraction(i: ButtonInteraction | ModalSubmitInteracti
 }
 
 const quoteLines = (s: string) => s.split('\n').map(l => '> ' + l).join('\n')
+
+// ---- prompts on screen and on Discord at once (perm-hook.ts) ---------------
+
+/**
+ * A prompt relayed by perm-hook.ts. Claude Code shows the same dialog in the
+ * terminal while the hook waits, and doesn't stop the hook when the dialog is
+ * answered there. So once the session no longer waits, retire() closes the
+ * Discord card, and ending the socket lets the hook exit without a decision.
+ */
+type Race = { sessionId: string; since: number; seenWaiting: boolean; retire: () => void }
+const races = new Map<Socket, Race>()
+/** The hook can reach us a moment before the session registry says "waiting". */
+const RACE_GRACE_MS = 8000
+
+function race(sock: Socket, sessionId: string, retire: () => void) {
+  races.set(sock, { sessionId, since: Date.now(), seenWaiting: false, retire })
+  sock.on('close', () => races.delete(sock))
+}
+
+/**
+ * A raced prompt was answered on Discord. The session still shows "waiting" until
+ * Claude Code takes the answer in; without a quiet period that moment would look
+ * like an unreported dialog and get a screen card of its own.
+ */
+const QUIET_AFTER_ANSWER_MS = 10_000
+
+function answeredRemotely(sock: Socket) {
+  const r = races.get(sock)
+  if (!r) return
+  races.delete(sock)
+  const t = tracked.get(r.sessionId)
+  if (t) t.quietUntil = Date.now() + QUIET_AFTER_ANSWER_MS
+}
+
+/** Every tick: retire the session's cards whose dialog was answered in the terminal. */
+function retireAnswered(t: Tracked) {
+  const waiting = t.live?.status === 'waiting'
+  for (const [sock, r] of races) {
+    if (r.sessionId !== t.sessionId) continue
+    if (waiting) {
+      r.seenWaiting = true
+      continue
+    }
+    if (!r.seenWaiting && Date.now() - r.since < RACE_GRACE_MS) continue
+    races.delete(sock)
+    r.retire()
+    sock.end()
+  }
+}
+
+/** Press a numbered option of the dialog on the session's screen, chosen by `pick` from what's there now. */
+async function pressOption(t: Tracked, pick: (options: DialogOption[]) => DialogOption | undefined): Promise<{ error?: string; label?: string }> {
+  const pane = t.live && tmuxPaneOf(t.live.pid)
+  if (!pane) return { error: m.noWayToType }
+  try {
+    await leaveCopyMode(pane)
+    const option = pick(dialogOptions(await capture(pane)))
+    if (!option) return { error: m.dialogNotFound }
+    await tmux(pane, ['send-keys', '-t', pane.pane, '-l', option.n])
+    return { label: option.label }
+  } catch (e: any) {
+    return { error: String(e?.message ?? e) }
+  }
+}
+
+// ---- tool permission prompts (perm-hook.ts) --------------------------------
+
+type PendingPerm = {
+  sock: Socket
+  channelId: string
+  messageId?: string
+  content: string
+  suggestions?: unknown[]
+  /** Retired before its message was sent. */
+  closed?: string
+}
+/** By request ID: five letters, so a prompt can also be answered with "yes abcde" like the channel's. */
+const perms = new Map<string, PendingPerm>()
+type PermAction = 'allow' | 'always' | 'deny' | 'tell'
+
+function newPermId(): string {
+  const letters = 'abcdefghijkmnopqrstuvwxyz'
+  for (;;) {
+    const id = Array.from({ length: 5 }, () => letters[Math.floor(Math.random() * letters.length)]).join('')
+    if (!perms.has(id)) return id
+  }
+}
+
+/** "Bash(npm test:*)" for each rule the prompt offers to remember ("don't ask again"). */
+function suggestedRules(suggestions: unknown[] | undefined): string[] {
+  return (suggestions ?? []).flatMap((s: any) =>
+    s?.type === 'addRules' && Array.isArray(s.rules) ? s.rules.map((r: any) => (r?.ruleContent ? `${r.toolName}(${r.ruleContent})` : String(r?.toolName))) : [],
+  )
+}
+
+/** What the tool is about to do: the command for Bash and the like, otherwise its input as JSON. */
+function toolPreview(input: Record<string, unknown>): string {
+  const fence = (lang: string, s: string) => '```' + lang + '\n' + clip(s, 1200).replace(/```/g, 'ˋˋˋ') + '\n```'
+  return typeof input.command === 'string' ? fence('bash', input.command) : fence('json', JSON.stringify(input, null, 2))
+}
+
+async function startPerm(sock: Socket, msg: Extract<ClientMsg, { t: 'perm' }>) {
+  const t = tracked.get(msg.sessionId)
+  const ch = t && (await channelOf(t))
+  // Paused: the prompt is only answered in the terminal.
+  if (!ch || isPaused(t.st)) return void ipcSend(sock, { t: 'perm_result' })
+  const id = newPermId()
+  const rules = suggestedRules(msg.suggestions)
+  const content = [
+    m.permissionNeeded(msg.toolName),
+    typeof msg.toolInput.description === 'string' ? msg.toolInput.description : '',
+    toolPreview(msg.toolInput),
+    rules.length ? m.alwaysAllowRules(clip(rules.join(', '), 300)) : '',
+    m.permissionReplyHint(id),
+  ]
+    .filter(Boolean)
+    .join('\n')
+  const p: PendingPerm = { sock, channelId: ch.id, content: chunk(content, 1800)[0], suggestions: msg.suggestions }
+  perms.set(id, p)
+  const close = (footer: string) => {
+    p.closed = footer
+    if (p.messageId) void ch.messages.edit(p.messageId, { content: `${p.content}\n\n${footer}`.slice(0, 2000), components: [] }).catch(() => {})
+  }
+  sock.on('close', () => {
+    if (perms.get(id) !== p) return
+    perms.delete(id)
+    // The terminal answered (Esc there ends the hook) or Claude Code's hook timeout ran out.
+    close(m.handledInTerminal)
+  })
+  race(sock, msg.sessionId, () => {
+    perms.delete(id)
+    close(m.handledInTerminal)
+  })
+  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`ph:allow:${id}`).setLabel(m.allow).setEmoji('✅').setStyle(ButtonStyle.Success),
+    ...(rules.length ? [new ButtonBuilder().setCustomId(`ph:always:${id}`).setLabel(m.allowAlways).setEmoji('♾️').setStyle(ButtonStyle.Primary)] : []),
+    new ButtonBuilder().setCustomId(`ph:deny:${id}`).setLabel(m.deny).setEmoji('❌').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`ph:tell:${id}`).setLabel(m.denyWithNote).setEmoji('💬').setStyle(ButtonStyle.Secondary),
+  )
+  const who = audience(t.st, 'approve')
+  const sent = await enqueue(ch.id, () =>
+    ch.send({ content: `${mentionsOf(who)}\n${p.content}`.slice(0, 2000), components: [row], allowedMentions: { users: who } }),
+  )
+  p.messageId = sent.id
+  if (p.closed) close(p.closed)
+}
+
+function permDecision(p: PendingPerm, action: PermAction, note?: string): PermDecision {
+  if (action === 'allow') return { behavior: 'allow' }
+  if (action === 'always') return { behavior: 'allow', updatedPermissions: p.suggestions }
+  if (action === 'tell') return { behavior: 'deny', message: `The user declined this on Discord and said:\n${note ?? ''}` }
+  // Like "No" in the terminal: stop and wait for what the user says next.
+  return { behavior: 'deny', message: 'The user declined this on Discord.', interrupt: true }
+}
+
+/** Answer a prompt from Discord: the hook prints the decision, which closes the terminal dialog too. */
+async function settlePerm(id: string, action: PermAction, by: string, note?: string) {
+  const p = perms.get(id)
+  if (!p) return
+  perms.delete(id)
+  answeredRemotely(p.sock)
+  ipcSend(p.sock, { t: 'perm_result', decision: permDecision(p, action, note) })
+  const label = action === 'allow' ? m.allowed : action === 'always' ? m.allowedAlways : m.denied
+  const footer = `**${label}**（${by}）${note ? '\n' + quoteLines(note) : ''}`
+  const ch = guild.channels.cache.get(p.channelId)
+  if (p.messageId && ch?.type === ChannelType.GuildText)
+    await ch.messages.edit(p.messageId, { content: `${p.content}\n\n${footer}`.slice(0, 2000), components: [] }).catch(() => {})
+}
+
+async function handlePermInteraction(i: ButtonInteraction | ModalSubmitInteraction) {
+  const match = /^ph(?::(allow|always|deny|tell):|tell:)([a-km-z]{5})$/.exec(i.customId)
+  if (!match) return
+  const [, action, id] = match
+  const p = perms.get(id)
+  if (!can(i.user.id, sessionByChannel(p?.channelId ?? i.channelId ?? ''), 'approve')) {
+    await i.reply({ content: m.notAuthorized, ephemeral: true })
+    return
+  }
+  if (!p) {
+    await i.reply({ content: m.permissionHandled, ephemeral: true })
+    return
+  }
+  if (action === 'tell') {
+    const input = new TextInputBuilder().setCustomId('text').setLabel(m.whatInstead).setStyle(TextInputStyle.Paragraph).setRequired(true)
+    await (i as ButtonInteraction).showModal(
+      new ModalBuilder().setCustomId(`phtell:${id}`).setTitle(m.denyWithNote).addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input)),
+    )
+    return
+  }
+  if (i.isModalSubmit()) {
+    if (i.isFromMessage()) await i.deferUpdate()
+    else await i.deferReply({ ephemeral: true })
+    await settlePerm(id, 'tell', i.user.username, i.fields.getTextInputValue('text').trim())
+    if (!i.isFromMessage()) await i.deleteReply().catch(() => {})
+    return
+  }
+  await i.deferUpdate()
+  await settlePerm(id, action as PermAction, i.user.username)
+}
+
+// ---- any other dialog: the screen, with its options as buttons -------------
+
+/**
+ * After waiting this long with no card from a hook, the dialog on screen is posted
+ * as is. That covers sessions started without ccd and dialogs no hook reports.
+ */
+const DIALOG_AFTER_MS = 3000
+type DialogCard = { channelId?: string; messageId?: string; options: DialogOption[]; closed?: string }
+/** By session ID. */
+const dialogs = new Map<string, DialogCard>()
+
+function watchDialog(t: Tracked) {
+  const card = dialogs.get(t.sessionId)
+  if (t.live?.status !== 'waiting') {
+    t.waitingSince = undefined
+    if (card) closeDialogCard(t.sessionId, card, m.dialogClosed)
+    return
+  }
+  t.waitingSince ??= Date.now()
+  if (card || isPaused(t.st) || Date.now() - t.waitingSince < DIALOG_AFTER_MS || Date.now() < (t.quietUntil ?? 0)) return
+  // The channel relays prompts itself; a hook's card already covers this dialog.
+  if (inputRoute(t) !== 'tmux') return
+  if ([...races.values()].some(r => r.sessionId === t.sessionId)) return
+  const pane = tmuxPaneOf(t.live.pid)
+  if (!pane) return
+  const c: DialogCard = { options: [] }
+  dialogs.set(t.sessionId, c)
+  void postDialogCard(t, pane, c).catch(e => log('dialog card failed:', e?.message ?? e))
+}
+
+async function postDialogCard(t: Tracked, pane: Pane, c: DialogCard) {
+  const screen = await capture(pane)
+  c.options = dialogOptions(screen)
+  const ch = await channelOf(t)
+  if (!ch) return
+  c.channelId = ch.id
+  const buttons = [
+    ...c.options.slice(0, 9).map(o =>
+      new ButtonBuilder()
+        .setCustomId(`dlg:${t.sessionId}:${o.n}`)
+        .setLabel(clip(`${o.n}. ${o.label}`, 80))
+        .setStyle(/^no\b/i.test(o.label) ? ButtonStyle.Danger : o.n === '1' ? ButtonStyle.Success : ButtonStyle.Secondary),
+    ),
+    new ButtonBuilder().setCustomId(`dlg:${t.sessionId}:esc`).setLabel(m.pressEsc).setStyle(ButtonStyle.Secondary),
+  ]
+  const rows = [buttons.slice(0, 5), buttons.slice(5, 10)].filter(r => r.length).map(r => new ActionRowBuilder<ButtonBuilder>().addComponents(...r))
+  const who = audience(t.st, 'approve')
+  const block = '```\n' + clipStart(screenTail(screen, 25), 1500).replace(/```/g, 'ˋˋˋ') + '\n```'
+  const sent = await enqueue(ch.id, () =>
+    ch.send({ content: `${mentionsOf(who)}\n${m.dialogWaiting}\n${block}\n${m.dialogHint}`.slice(0, 2000), components: rows, allowedMentions: { users: who } }),
+  )
+  c.messageId = sent.id
+  if (c.closed) closeDialogCard(t.sessionId, c, c.closed)
+}
+
+function closeDialogCard(sessionId: string, c: DialogCard, footer: string) {
+  if (dialogs.get(sessionId) === c) dialogs.delete(sessionId)
+  c.closed = footer
+  const ch = c.channelId ? guild.channels.cache.get(c.channelId) : undefined
+  if (!c.messageId || ch?.type !== ChannelType.GuildText) return
+  const id = c.messageId
+  c.messageId = undefined
+  void ch.messages
+    .fetch(id)
+    .then(msg => msg.edit({ content: `${msg.content}\n${footer}`.slice(0, 2000), components: [] }))
+    .catch(() => {})
+}
+
+async function handleDialogButton(i: ButtonInteraction) {
+  const match = /^dlg:([\w-]+):(\d|esc)$/.exec(i.customId)
+  if (!match) return
+  const [, sid, key] = match
+  const t = tracked.get(sid)
+  if (!can(i.user.id, t?.st ?? sessionByChannel(i.channelId), 'approve')) {
+    await i.reply({ content: m.notAuthorized, ephemeral: true })
+    return
+  }
+  const c = dialogs.get(sid)
+  const pane = t?.live && tmuxPaneOf(t.live.pid)
+  if (!t?.live || !c || t.live.status !== 'waiting' || !pane) {
+    await i.reply({ content: m.dialogGone, ephemeral: true })
+    return
+  }
+  let label = 'Esc'
+  if (key === 'esc') {
+    await leaveCopyMode(pane)
+    await tmux(pane, ['send-keys', '-t', pane.pane, 'Escape'])
+  } else {
+    // The dialog may have changed since the snapshot: only press an option that is still the same.
+    const then = c.options.find(o => o.n === key)
+    const r = await pressOption(t, now => now.find(o => o.n === key && o.label === then?.label))
+    if (r.error) {
+      await i.reply({ content: m.dialogChanged, ephemeral: true })
+      // Post the current screen instead.
+      closeDialogCard(sid, c, m.dialogClosed)
+      t.waitingSince = Date.now() - DIALOG_AFTER_MS
+      return
+    }
+    label = `${key}. ${r.label}`
+  }
+  await i.deferUpdate()
+  // Whatever comes next (another dialog) gets its own card, once this one has closed.
+  t.waitingSince = undefined
+  t.quietUntil = Date.now() + QUIET_AFTER_ANSWER_MS / 2
+  closeDialogCard(sid, c, `**${m.dialogAnswered(clip(label, 100))}**（${i.user.username}）`)
+}
+
+// ---- /screen and /key: see and drive the terminal ----------------------------
+
+async function showScreen(r: Replier, channelId: string) {
+  const t = trackedByChannel(channelId)
+  if (!t?.live) return void (await r.reply(t || endedByChannel(channelId) ? m.alreadyEnded : m.notSessionChannel))
+  const screen = await screenOf(t.live.pid)
+  if (screen === undefined) return void (await r.reply(m.noWayToType))
+  await r.reply(`${m.screenNow}\n\`\`\`\n${clipStart(screenTail(screen, 40), 1850).replace(/```/g, 'ˋˋˋ')}\n\`\`\``)
+}
+
+/** Press keys in the session's pane ("down down enter", "2", "esc"), then show the screen. */
+async function pressKeys(r: Replier, channelId: string, spec: string) {
+  const t = trackedByChannel(channelId)
+  if (!t?.live) return void (await r.reply(t || endedByChannel(channelId) ? m.alreadyEnded : m.notSessionChannel))
+  const keys = parseKeys(spec)
+  if (!keys) return void (await r.reply(m.keyUsage))
+  const pane = tmuxPaneOf(t.live.pid)
+  if (!pane) return void (await r.reply(m.noWayToType))
+  await leaveCopyMode(pane)
+  for (const k of keys) await tmux(pane, ['send-keys', '-t', pane.pane, ...k])
+  await Bun.sleep(800)
+  const screen = await capture(pane)
+  await r.reply(`${m.keysSent(spec.trim())}\n\`\`\`\n${clipStart(screenTail(screen, 20), 1700).replace(/```/g, 'ˋˋˋ')}\n\`\`\``)
+}
 
 // ---- !new: start a ccd session in tmux --------------------------------------
 
@@ -1541,16 +2017,19 @@ async function runCommand(r: Replier, channelId: string, cmd: Command, dir?: str
   }
 }
 
-/** English description plus a zh-TW localization; Discord shows each user their own language. */
+/** English description plus zh-TW and zh-CN localizations; Discord shows each user their own language. */
 const described = <T extends { setDescription(d: string): T; setDescriptionLocalizations(l: Record<string, string>): T }>(
   b: T,
   key: keyof typeof SLASH_DESCRIPTIONS,
-) => b.setDescription(SLASH_DESCRIPTIONS[key].en).setDescriptionLocalizations({ 'zh-TW': SLASH_DESCRIPTIONS[key]['zh-TW'] })
+) =>
+  b
+    .setDescription(SLASH_DESCRIPTIONS[key].en)
+    .setDescriptionLocalizations({ 'zh-TW': SLASH_DESCRIPTIONS[key]['zh-TW'], 'zh-CN': SLASH_DESCRIPTIONS[key]['zh-CN'] })
 
-/** A slash command choice named in English with a zh-TW localization. */
+/** A slash command choice named in English with zh-TW and zh-CN localizations. */
 const choice = (value: string, key: keyof typeof SLASH_DESCRIPTIONS) => ({
   name: SLASH_DESCRIPTIONS[key].en,
-  name_localizations: { 'zh-TW': SLASH_DESCRIPTIONS[key]['zh-TW'] },
+  name_localizations: { 'zh-TW': SLASH_DESCRIPTIONS[key]['zh-TW'], 'zh-CN': SLASH_DESCRIPTIONS[key]['zh-CN'] },
   value,
 })
 
@@ -1598,6 +2077,8 @@ const SLASH_COMMANDS = [
   described(new SlashCommandBuilder().setName('model'), 'model').addStringOption(o =>
     described(o.setName('name'), 'modelName').setRequired(true).setAutocomplete(true),
   ),
+  described(new SlashCommandBuilder().setName('screen'), 'screen'),
+  described(new SlashCommandBuilder().setName('key'), 'key').addStringOption(o => described(o.setName('keys'), 'keyKeys').setRequired(true).setMaxLength(120)),
 ]
 
 /** Autocomplete for /new: subfolders of what's typed so far, then recently used folders. */
@@ -1948,8 +2429,8 @@ function roleTag(userId: string, st: SessionState): string {
 const MEETINGS_DIR = join(STATE_DIR, 'meetings')
 const MEETING_IDLE_MS = 30 * 60_000
 const MEETING_ASK_TIMEOUT_MS = 10 * 60_000
-const MEETING_END_RE = /^(end|結束)(?=\s|$)\s*/i
-const MEETING_SAVE_RE = /^(save|存檔)(?=\s|$)\s*/i
+const MEETING_END_RE = /^(end|結束|结束)(?=\s|$)\s*/i
+const MEETING_SAVE_RE = /^(save|存檔|存档)(?=\s|$)\s*/i
 
 /** One message of a meeting, as recorded on disk. */
 type MeetingEntry = {
@@ -2170,7 +2651,8 @@ async function closeMeeting(t: Tracked, opts: { by?: Message; conclusion?: strin
   meetingWrites.delete(mt.threadId)
 
   const peer = t.live ? peers.get(t.live.pid) : undefined
-  const handoff = opts.handoff && !!peer && !isPaused(t.st)
+  const route = inputRoute(t)
+  const handoff = opts.handoff && !!route && !isPaused(t.st)
   const entries = readMeetingEntries(t.sessionId, mt)
   const people = [...new Map(entries.filter(e => e.role !== 'claude').map(e => [e.name, e.role])).entries()]
   mt.endedAt = Date.now()
@@ -2195,18 +2677,28 @@ async function closeMeeting(t: Tracked, opts: { by?: Message; conclusion?: strin
 
   if (handoff) {
     const by = opts.by!
-    ipcSend(peer!, {
-      t: 'message',
-      content: mt.conclusion ?? '(no conclusion given)',
-      meta: {
-        message_id: by.id,
-        user: by.author.username,
-        ...(isOwner(by.author.id) ? {} : { role: roleTag(by.author.id, t.st) }),
-        ts: by.createdAt.toISOString(),
-        meeting: `${entries.length} messages from ${people.map(([n]) => n).join(', ')}`,
-        attachments: [md, ...entries.flatMap(e => (e.files ?? []).flatMap(f => (f.path ? [f.path] : [])))].join('; '),
-      },
-    })
+    const role = isOwner(by.author.id) ? undefined : roleTag(by.author.id, t.st)
+    const meeting = `${entries.length} messages from ${people.map(([n]) => n).join(', ')}`
+    const files = [md, ...entries.flatMap(e => (e.files ?? []).flatMap(f => (f.path ? [f.path] : [])))]
+    if (route === 'channel') {
+      ipcSend(peer!, {
+        t: 'message',
+        content: mt.conclusion ?? '(no conclusion given)',
+        meta: {
+          message_id: by.id,
+          user: by.author.username,
+          ...(role ? { role } : {}),
+          ts: by.createdAt.toISOString(),
+          meeting,
+          attachments: files.join('; '),
+        },
+      })
+    } else {
+      // No channel metadata: say in the text what the channel's instructions would have explained.
+      const text = `${mt.conclusion ?? '(no conclusion given)'}\n\n(People discussed this among themselves on Discord: ${meeting}. The first attached file is the transcript; read it first and act on the conclusion above. If there is no conclusion, summarize the discussion, decisions and open questions, and propose next steps before changing anything.)`
+      const { error } = await typeMessage(t, typedText(text, files, role ? { user: by.author.username, role } : undefined))
+      if (error) log(`meeting handoff to ${t.sessionId} failed:`, error)
+    }
     t.st.lastPrompt = (mt.conclusion ?? m.meetingLastPrompt).replace(/\s+/g, ' ').slice(0, 200)
   }
   const record = await postMeetingRecord(t, mt, html, entries.length).catch(e => void log('meeting record post failed:', e?.message ?? e))
@@ -2586,7 +3078,7 @@ async function setSync(r: Replier, channelId: string, on: boolean, by: string) {
 
 // ---- /share, /unshare, /members, /sync -------------------------------------------
 
-const SESSION_COMMANDS = ['share', 'unshare', 'members', 'sync', 'model', 'mode', 'rename', 'handoff', 'usage'] as const
+const SESSION_COMMANDS = ['share', 'unshare', 'members', 'sync', 'model', 'mode', 'rename', 'handoff', 'usage', 'screen', 'key'] as const
 
 async function handleSessionCommand(i: import('discord.js').ChatInputCommandInteraction) {
   const st = sessionByChannel(i.channelId)
@@ -2613,6 +3105,8 @@ async function handleSessionCommand(i: import('discord.js').ChatInputCommandInte
   if (i.commandName === 'model') return setModel(r, i.channelId, i.options.getString('name', true).trim())
   if (i.commandName === 'rename') return renameSession(r, i.channelId, i.options.getString('name', true).trim())
   if (i.commandName === 'handoff') return makeHandoff(r, i.channelId, i.options.getString('note')?.trim() || undefined)
+  if (i.commandName === 'screen') return showScreen(r, i.channelId)
+  if (i.commandName === 'key') return pressKeys(r, i.channelId, i.options.getString('keys', true))
   const user = i.options.getUser('user', true)
   if (user.bot) return void (await r.reply(m.cantShareWithBot))
   await share(r, i.channelId, user.id, i.commandName === 'share' ? (i.options.getString('role', true) as Role) : undefined)
@@ -2777,8 +3271,12 @@ async function claimGuild() {
     await ch.send({ content: m.guildTaken(hostname()), allowedMentions: { parse: [] } }).catch(() => {})
     process.exit(0)
   }
+  // Discord allows 2 topic edits per 10 minutes, and a rate-limited edit would hold up startup:
+  // skip a recent claim of our own (quick restarts), and don't wait for the edit.
+  const own = CLAIM_RE.exec(fresh.topic ?? '')
+  if (own?.[1] === HOST_ID && Date.now() - Number(own[2]) * 1000 < CLAIM_EVERY_MS / 2 && fresh.topic?.startsWith(m.consoleTopic)) return
   const topic = `${m.consoleTopic}\n-# cds-host=${HOST_ID} seen=${Math.floor(Date.now() / 1000)} (${hostname().replace(/[()]/g, '')})`
-  await fresh.setTopic(clip(topic, 1024)).catch(e => log('console topic update failed:', e?.message ?? e))
+  void fresh.setTopic(clip(topic, 1024)).catch(e => log('console topic update failed:', e?.message ?? e))
 }
 
 /**
@@ -2812,12 +3310,17 @@ function trackedByPid(pid: number): Tracked | undefined {
 }
 
 async function handlePeer(sock: Socket, msg: ClientMsg, self: { pid?: number }) {
+  // If posting the card fails, answer anyway so the hook exits and the terminal dialog is left to the user.
   if (msg.t === 'ask') {
-    await startAsk(sock, msg.sessionId, msg.questions)
+    await startAsk(sock, msg.sessionId, msg.questions, msg.race).catch(e => (log('question card failed:', e?.message ?? e), ipcSend(sock, { t: 'ask_result' })))
     return
   }
   if (msg.t === 'plan') {
-    await startPlan(sock, msg.sessionId, msg.plan)
+    await startPlan(sock, msg.sessionId, msg.plan, msg.race).catch(e => (log('plan card failed:', e?.message ?? e), ipcSend(sock, { t: 'ask_result' })))
+    return
+  }
+  if (msg.t === 'perm') {
+    await startPerm(sock, msg).catch(e => (log('permission card failed:', e?.message ?? e), ipcSend(sock, { t: 'perm_result' })))
     return
   }
   if (msg.t === 'pause') {
@@ -2843,7 +3346,7 @@ async function handlePeer(sock: Socket, msg: ClientMsg, self: { pid?: number }) 
     else peerTmux.delete(msg.claudePid)
     log(`channel server connected for pid ${msg.claudePid}`)
     const t = trackedByPid(msg.claudePid)
-    if (t) await post(t, [m.channelConnected])
+    if (t) await post(t, [cfg.channels ? m.channelConnected : m.hooksConnected])
     return
   }
   const t = self.pid ? trackedByPid(self.pid) : undefined

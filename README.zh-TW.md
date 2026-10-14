@@ -1,12 +1,14 @@
 # claude-discord-sync
 
-[English](README.md) · **繁體中文**
+[English](README.md) · **繁體中文** · [简体中文](README.zh-CN.md)
 
 把本機每個 Claude Code session 同步到各自的 Discord 頻道，並且能從 Discord 操作 session：跟 Claude 對話、用下拉選單回答它的問題、用按鈕核准計畫和權限、中斷它，也能用手機開新 session、結束或恢復 session。
 
-> 這是非官方的社群專案，跟 Anthropic 沒有關係。它用到 Claude Code 的 *channels* 功能（research preview）和 Claude Code 內部的 session 檔案，所以 Claude Code 更新後可能會壞掉。
+> 這是非官方的社群專案，和 Anthropic 沒有關係。它用到了 Claude Code 內部的 session 檔案和螢幕內容，所以 Claude Code 更新後可能會失效。
+>
+> **這個 fork 不依賴 Claude Code 的 *channels***（research preview，需要 claude.ai 或 Console 登入，經第三方 API 中轉時用不了）。預設情況下，Discord 的訊息會輸入到 session 所在的 tmux 窗格，權限等確認透過 `PermissionRequest` hook 發到 Discord，同時終端機裡也照常顯示。詳見[不使用 channels](#不使用-channels)。設定 `"channels": true` 可以恢復原來基於 channel 的行為。
 
-Discord 上的文字支援英文和繁體中文，用設定裡的 `"language"` 切換，**預設是英文**，要用中文請設成 `"zh-TW"`。
+Discord 上的文字支援英文、繁體中文和簡體中文，用設定裡的 `"language"` 切換，**預設是英文**，要用繁體中文請設成 `"zh-TW"`。
 
 ```
  Discord guild                        本機
@@ -109,6 +111,21 @@ token 會依序從 `DISCORD_BOT_TOKEN` 環境變數、`~/.claude/channels/discor
 
 自己編譯執行檔：`bun build --compile --target=bun-<os>-<arch> src/cli.ts`。推送 `v*` 開頭的 tag，GitHub Actions 會自動編譯所有平台並發布。
 
+## 不使用 channels
+
+能做什麼、怎麼做到的：
+
+| | 做法 |
+|---|---|
+| 從 Discord 對話 | 訊息會以一次 bracketed paste 貼上到 tmux 裡 session 的輸入列（所以換行、中文、開頭的 `!` 或 `/` 都會原樣到達），然後按 Enter。Claude 正在工作時，Claude Code 會把它排到當前這一輪之後。如果終端正開著對話方塊，或輸入列裡有本地還沒發出的文字，就拒絕傳送並說明原因 |
+| 權限確認 | 按鈕：“允許”“始終允許”（加入終端機裡“不再詢問”那條規則）“拒絕”“拒絕並說明”。終端機裡同時也會顯示同一個對話方塊，哪邊先回答就以哪邊為準；在本地回答後，Discord 上的卡片會自動關閉 |
+| 選擇題（AskUserQuestion） | 和原來一樣是下拉選單，同時終端機裡的對話方塊也開著 |
+| 計劃（ExitPlanMode） | “核准・自動接受編輯”“核准・逐個確認編輯”（這兩個會在終端機裡按下對應選項，因為 Claude Code 不接受 hook 對計劃的核准）和“修改”（意見會交回給 Claude） |
+| 其他對話方塊 | 等待超過 3 秒、又沒有對應卡片時，會把畫面截圖發上來，帶上編號選項按鈕和“Esc”按鈕。用普通 `claude` 啟動的 session 也適用 |
+| `/screen`、`/key` | 檢視終端機畫面，以及在終端機裡按鍵（`/key 2`、`/key down down enter`、`/key esc`），處理按鈕覆蓋不到的情況 |
+
+哪些 session 接受輸入由 `tmuxInput` 決定：所有在 tmux 裡執行的 session（預設）、只有 `ccd` 啟動的，或者都不接受。不在 tmux 裡的 session 保持唯讀。想用全部功能（權限卡片、`send_file`），請在 tmux 裡用 `ccd` 啟動；tmux 裡的普通 `claude` 可以對話、看畫面截圖和用 `/key`。
+
 ## 指令
 
 | 指令 | 在哪裡用 | 作用 |
@@ -126,6 +143,8 @@ token 會依序從 `DISCORD_BOT_TOKEN` 環境變數、`~/.claude/channels/discor
 | `/sync off`／`/sync on` | session 頻道，或在其他地方對所有 session | 暫停／恢復同步（見[暫停同步](#暫停同步)） |
 | `/mode <模式>` | session 頻道 | 切換權限模式（default、accept edits、plan、auto、bypass permissions），做法是一直按 Shift+Tab，直到 session 底部顯示該模式。session 必須在 tmux 裡（`/new` 開的都是）或是 Windows 主控台視窗 |
 | `/model <名稱>` | session 頻道 | 切換模型（`opus`、`sonnet`、`haiku`、`fable`、`default` 或模型 ID）。做法是在 session 裡輸入 `/model`，所以 Claude 必須是閒置狀態。跟在本機輸入一樣，也會變成新 session 的預設模型 |
+| `/screen` | session 頻道 | 顯示這個 session 的終端機畫面（tmux） |
+| `/key <按鍵>` | session 頻道 | 在 session 的終端機裡按鍵：`esc enter up down left right tab stab space bs c-c`，或單個字母、數字，最多 12 個，例如 `/key down enter` |
 | `yes abcde` / `no abcde` | session 頻道 | 用代碼回答權限請求 |
 
 每個指令都可以改用 `!new`、`!stop`、`!sync off` 這種寫法。
@@ -215,7 +234,7 @@ session 頻道預設是私人的，只有 bot 和 `allowFrom` 裡的擁有者看
 
 | 設定 | 說明 |
 |---|---|
-| `language` | `"en"`（預設）或 `"zh-TW"`。斜線指令的說明不受這個設定影響，會依照每個人自己的 Discord 語言顯示 |
+| `language` | `"en"`（預設）、`"zh-TW"` 或 `"zh-CN"`。斜線指令的說明不受這個設定影響，會依照每個人自己的 Discord 語言顯示 |
 | `guildId` | 這台電腦使用的伺服器，設定時會詢問。每台電腦需要各自的伺服器 |
 | `allowFrom` | 擁有者：對所有 session 有完整權限的 Discord user ID。其他人只能使用 session [分享](#分享)給他們的權限 |
 | `categoryName` | session 頻道所在的分類 |
@@ -228,6 +247,8 @@ session 頻道預設是私人的，只有 bot 和 `allowFrom` 裡的擁有者看
 | `notifyMinBusySec` | 工作至少幾秒才發完成通知；設成 `-1` 就關閉 |
 | `liveStatus` | Claude 工作時，在頻道底部保留一則訊息，顯示已經工作多久、正在用哪個工具；設成 `false` 就關閉 |
 | `attachOver` | 回覆超過幾個字就改成附檔 |
+| `channels` | `false`（預設）：透過 tmux 和 hook 操作 session，見[不使用 channels](#不使用-channels)。`true`：把 `ccd` 啟動的 session 作為 Claude Code channel 載入（需要 claude.ai 或 Console 登入） |
+| `tmuxInput` | tmux 裡的哪些 session 接受 Discord 訊息輸入：`"all"`（預設，普通 `claude` 也算）、`"ccd"` 或 `"off"` |
 
 環境變數 `DISCORD_SYNC_ASK_TIMEOUT`（秒，預設 600）決定選擇題或計畫在 Discord 上等多久，逾時就回到終端機作答。
 

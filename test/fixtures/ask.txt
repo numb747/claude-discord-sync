@@ -1,0 +1,44 @@
+
+ ▐▛███▛█   Claude Code v2.1.273
+▝▜██████▀  Haiku 4.5 · API Usage Billing
+  ▝▝ ▝▝    ~/project
+
+
+❯ /clear
+
+❯ Use the AskUserQuestion tool to ask me two questions at once: favourite color (red/green/blue) and favourite fruit (apple/pear). Nothing else.
+
+  Thought for 9s
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+←  ☐ Color  ☐ Fruit  ✔ Submit  →
+
+What is your favourite color?
+
+❯ 1. Red
+     Red color
+  2. Green
+     Green color
+  3. Blue
+     Blue color
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
