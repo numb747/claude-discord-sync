@@ -7,6 +7,8 @@
 > 这是非官方的社区项目，和 Anthropic 没有关系。它用到了 Claude Code 内部的 session 文件和屏幕内容，所以 Claude Code 更新后可能会失效。
 >
 > **这个 fork 不依赖 Claude Code 的 *channels***（research preview，需要 claude.ai 或 Console 登录，经第三方 API 中转时用不了）。默认情况下，Discord 的消息会输入到 session 所在的 tmux 窗格，权限等确认通过 `PermissionRequest` hook 发到 Discord，同时终端里也照常显示。详见[不使用 channels](#不使用-channels)。设置 `"channels": true` 可以恢复原来基于 channel 的行为。
+>
+> 📖 **[使用指南](docs/guide.zh-CN.md)**：安装、用手机远程工作的日常流程、每种卡片的作用、安全和故障排查。
 
 Discord 上的文字支持英文、繁体中文和简体中文，用配置里的 `"language"` 切换，**默认是英文**，要用简体中文请设成 `"zh-CN"`。
 
@@ -19,15 +21,16 @@ Discord 上的文字支持英文、繁体中文和简体中文，用配置里的
  │   #web-ffe3            │   │  └ Unix socket ◀──┐                          │
  │ 📁 Claude 已结束       │   │                   │                          │
  └───────────────────────┘   │ channel-server.ts（每个 ccd session 一个）    │
-                             │  └ MCP channel：Discord ⇄ Claude Code         │
-                             │ ask-hook.ts / stop-hook.ts（ccd 挂的 hook）   │
+                             │  └ MCP：报告 PID / tmux 窗格、send_file       │
+                             │ perm-hook.ts / stop-hook.ts（ccd 挂的 hook）  │
+                             │ tmux ◀── 粘贴 Discord 消息、按键              │
                              └──────────────────────────────────────────────┘
 ```
 
 ## 功能
 
 - **每个 session 一个频道。** 每个运行中的 Claude Code session 都有自己的频道，Claude Code 为 session 生成标题后（或用 `/rename` 命名后），频道会改名为 `项目・标题`；你的输入、Claude 的回复和工具调用摘要都会实时同步。太长的回复只发预览，全文作为 `.md` 附件。
-- **双向对话：** 用 `ccd`（`claude` 的包装命令）启动的 session，在频道里发的消息和附件都会转给 Claude。
+- **双向对话：** 在 tmux 里运行的 session（最好用 `claude` 的包装命令 `ccd` 启动），在频道里发的消息和附件都会转给 Claude。
 - **选择题和计划变成按钮：** `AskUserQuestion` 会变成下拉菜单，可以选“其他”自己输入；`ExitPlanMode` 会变成“批准 / 继续修改 / 改在终端回答”按钮。
 - **权限请求**会附带“允许 / 拒绝”按钮并 @ 你。
 - **完成通知：** Claude 做完一段较长的工作时会 @ 你。
@@ -57,6 +60,8 @@ Linux 是测试过的平台，macOS 和 Windows 是新加入的支持，遇到�
 
 ## 安装
 
+> **本 fork 请从源码安装**（见下方）。一键安装脚本下载的是上游的预编译版本，不含本 fork 的改动。
+
 **macOS／Linux：**
 
 ```bash
@@ -83,7 +88,7 @@ irm https://raw.githubusercontent.com/Cnyn0403/claude-discord-sync/master/instal
 ccd                 # 所有参数都会透传，例如 ccd --resume
 ```
 
-启动时 Claude Code 会要求你确认 development channel，因为自制的 channel 目前还是 research preview。用普通 `claude` 启动的 session 同样会被同步，只是在 Discord 上是只读的。
+请在 tmux 里运行：Discord 的消息是通过 tmux 输入到 session 里的。设置 `"channels": true` 时则改为：启动时 Claude Code 会要求你确认 development channel，用普通 `claude` 启动的 session 在 Discord 上是只读的。
 
 | | |
 |---|---|
@@ -99,9 +104,9 @@ ccd                 # 所有参数都会透传，例如 ccd --resume
 适合开发，或者没有预编译可执行文件的平台。需要 [Bun](https://bun.sh)。
 
 ```bash
-git clone https://github.com/Cnyn0403/claude-discord-sync.git
+git clone https://github.com/numb747/claude-discord-sync.git
 cd claude-discord-sync
-bun install
+bun install --frozen-lockfile
 bun src/cli.ts setup        # 同样的安装向导；ccd 会指向这个文件夹里的 bin/ccd
 ```
 
@@ -121,7 +126,7 @@ token 会依次从 `DISCORD_BOT_TOKEN` 环境变量、`~/.claude/channels/discor
 | 权限确认 | 按钮：“允许”“始终允许”（加入终端里“不再询问”那条规则）“拒绝”“拒绝并说明”。终端里同时也会显示同一个对话框，哪边先回答就以哪边为准；在本地回答后，Discord 上的卡片会自动关闭 |
 | 选择题（AskUserQuestion） | 和原来一样是下拉菜单，同时终端里的对话框也开着 |
 | 计划（ExitPlanMode） | “批准・自动接受编辑”“批准・逐个确认编辑”（这两个会在终端里按下对应选项，因为 Claude Code 不接受 hook 对计划的批准）和“修改”（意见会交回给 Claude） |
-| 其他对话框 | 等待超过 3 秒、又没有对应卡片时，会把屏幕截图发上来，带上编号选项按钮和“Esc”按钮。用普通 `claude` 启动的 session 也适用 |
+| 其他对话框 | 等待超过 3 秒（`ccd` 启动的 session 为 8 秒，因为通常由 hook 报告对话框）、又没有对应卡片时，会把屏幕截图发上来，带上编号选项按钮和“Esc”按钮。用普通 `claude` 启动的 session 也适用 |
 | `/screen`、`/key` | 查看终端画面，以及在终端里按键（`/key 2`、`/key down down enter`、`/key esc`），处理按钮覆盖不到的情况 |
 
 哪些 session 接受输入由 `tmuxInput` 决定：所有在 tmux 里运行的 session（默认）、只有 `ccd` 启动的，或者都不接受。不在 tmux 里的 session 保持只读。想用全部功能（权限卡片、`send_file`），请在 tmux 里用 `ccd` 启动；tmux 里的普通 `claude` 可以对话、看屏幕截图和用 `/key`。
@@ -262,10 +267,10 @@ session 频道默认是私密的，只有 bot 和 `allowFrom` 里的所有者能
 | 本机 → Discord | 持续读取 `~/.claude/projects/<dir>/<session>.jsonl`，转成用户输入、回复和工具调用（`src/render.ts`） |
 | Discord → 本机 | 确认输入行正在显示且为空之后，粘贴到 session 的 tmux 窗格（`src/terminal.ts`）。设置 `"channels": true` 时改为由 `ccd` 把 `channel-server.ts` 作为 Claude Code 的 channel 加载，消息以 `<channel source="discord-sync">` 的形式送进 session |
 | 权限 | `PermissionRequest` hook（`src/perm-hook.ts`）请 daemon 发出按钮；hook 输出的决定也会关闭终端里的对话框。如果终端先回答了，daemon 看到 session 不再等待，就结束这个 hook。使用 channels 时由 channel 的 permission relay 发出按钮 |
-| 其他对话框 | session 等待超过 3 秒时，daemon 读取 tmux 屏幕，解析编号选项，按下你选的那个 |
+| 其他对话框 | session 等待超过 3 秒（`ccd` 启动的为 8 秒）时，daemon 读取 tmux 屏幕，解析编号选项，按下你选的那个 |
 | 选择题和计划 | `AskUserQuestion` 和 `ExitPlanMode` 的 `PreToolUse` hook（`src/ask-hook.ts`）会让 daemon 发出菜单或按钮，再通过 `updatedInput.answers` 交回答案，或者带着意见允许／拒绝 |
 | 中断 | session 在 tmux 里就用 `tmux send-keys Escape`；否则由 channel server 通过 `TIOCSTI` 把 Esc 塞进 Claude Code 的终端。两者都不行时，`src/stop-hook.ts` 会在 Claude 下一次调用工具前让它停下 |
-| 新建 / 恢复 | 用 `tmux new-session` 运行 `ccd`，自动接受启动时的确认界面（development channel、信任文件夹）；启动失败时会把最后的屏幕内容发回来 |
+| 新建 / 恢复 | 用 `tmux new-session` 运行 `ccd`，自动接受启动时的确认界面（信任文件夹；设置 `"channels": true` 时还有 development channel）；启动失败时会把最后的屏幕内容发回来 |
 | 删除频道 | 运行中 session 的频道被删除时，会自动重建并补发最近的消息。已结束的频道被删除时，会把 session 从列表中移除 |
 
 ## 安全性

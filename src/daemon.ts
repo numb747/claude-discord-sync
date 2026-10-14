@@ -1506,6 +1506,8 @@ async function handlePermInteraction(i: ButtonInteraction | ModalSubmitInteracti
  * as is. That covers sessions started without ccd and dialogs no hook reports.
  */
 const DIALOG_AFTER_MS = 3000
+/** ccd sessions: their hook usually reports the dialog itself, so give it longer before posting the screen. */
+const DIALOG_AFTER_HOOKED_MS = 8000
 type DialogCard = { channelId?: string; messageId?: string; options: DialogOption[]; closed?: string }
 /** By session ID. */
 const dialogs = new Map<string, DialogCard>()
@@ -1518,7 +1520,8 @@ function watchDialog(t: Tracked) {
     return
   }
   t.waitingSince ??= Date.now()
-  if (card || isPaused(t.st) || Date.now() - t.waitingSince < DIALOG_AFTER_MS || Date.now() < (t.quietUntil ?? 0)) return
+  const after = peers.has(t.live.pid) ? DIALOG_AFTER_HOOKED_MS : DIALOG_AFTER_MS
+  if (card || isPaused(t.st) || Date.now() - t.waitingSince < after || Date.now() < (t.quietUntil ?? 0)) return
   // The channel relays prompts itself; a hook's card already covers this dialog.
   if (inputRoute(t) !== 'tmux') return
   if ([...races.values()].some(r => r.sessionId === t.sessionId)) return
@@ -3311,6 +3314,7 @@ function trackedByPid(pid: number): Tracked | undefined {
 
 async function handlePeer(sock: Socket, msg: ClientMsg, self: { pid?: number }) {
   // If posting the card fails, answer anyway so the hook exits and the terminal dialog is left to the user.
+  // For a plan that's ask_result too: a plan_result would be read as approved or sent back.
   if (msg.t === 'ask') {
     await startAsk(sock, msg.sessionId, msg.questions, msg.race).catch(e => (log('question card failed:', e?.message ?? e), ipcSend(sock, { t: 'ask_result' })))
     return

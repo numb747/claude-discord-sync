@@ -7,6 +7,8 @@ Mirror every Claude Code session on your machine into its own Discord channel, a
 > Unofficial community project, not affiliated with Anthropic. It relies on Claude Code's internal session files and screen, so a Claude Code update can break it.
 >
 > **This fork works without Claude Code's *channels*** (a research preview that needs a claude.ai or Console login and is unavailable through third-party API gateways). By default, Discord messages are typed into the session's tmux pane, and prompts reach Discord through a `PermissionRequest` hook while the terminal shows them too. See [Without channels](#without-channels). `"channels": true` brings back the original channel-based behaviour.
+>
+> 📖 **[Guide](docs/guide.md)**: setup, the day-to-day workflow from your phone, what each card does, security and troubleshooting.
 
 The Discord-facing text is available in English, Traditional Chinese and Simplified Chinese (`"language"` in the config).
 
@@ -19,15 +21,16 @@ The Discord-facing text is available in English, Traditional Chinese and Simplif
  │   #web-ffe3            │   │  └ Unix socket ◀──┐                          │
  │ 📁 … (ended)           │   │                   │                          │
  └───────────────────────┘   │ channel-server.ts (one per ccd session)      │
-                             │  └ MCP channel: Discord ⇄ Claude Code         │
-                             │ ask-hook.ts / stop-hook.ts (ccd hooks)       │
+                             │  └ MCP: reports PID / tmux pane, send_file    │
+                             │ perm-hook.ts / stop-hook.ts (ccd hooks)      │
+                             │ tmux ◀── Discord messages pasted, keys pressed │
                              └──────────────────────────────────────────────┘
 ```
 
 ## Features
 
 - **One channel per session.** Every running Claude Code session gets a channel, named `project・title` once Claude Code has titled the session (or after `/rename`); your prompts, Claude's replies and one-line tool summaries are mirrored live. Long replies are posted as a preview plus a `.md` attachment.
-- **Two-way chat** for sessions started with `ccd` (a wrapper around `claude`). Messages and attachments you post in the channel go to Claude.
+- **Two-way chat** for sessions running in tmux (best started with `ccd`, a wrapper around `claude`). Messages and attachments you post in the channel go to Claude.
 - **Questions and plans as components.** `AskUserQuestion` becomes select menus (with a free-text "other" option); `ExitPlanMode` becomes *Approve / Revise / Answer in terminal* buttons.
 - **Permission prompts** get *Allow / Deny* buttons and an @-mention.
 - **Done notifications.** You're @-mentioned when Claude finishes a turn that took a while.
@@ -57,6 +60,8 @@ Linux is the tested platform. macOS and Windows support is new; please [open an 
 
 ## Install
 
+> **This fork: install from source** (below). The one-line installers download upstream's prebuilt release, which doesn't have this fork's changes.
+
 **macOS / Linux:**
 
 ```bash
@@ -83,7 +88,7 @@ Then open a new terminal and start Claude Code with `ccd` instead of `claude`:
 ccd                 # all arguments pass through, e.g. ccd --resume
 ```
 
-Claude Code asks you to confirm the development channel on startup, because custom channels are a research preview. Sessions started with plain `claude` are still mirrored, but read-only on Discord.
+Run it inside tmux: that is how Discord messages reach the session. With `"channels": true`, Claude Code asks you to confirm the development channel on startup instead, and sessions started with plain `claude` are read-only on Discord.
 
 | | |
 |---|---|
@@ -99,9 +104,9 @@ The executables are not code-signed. If Windows SmartScreen or macOS Gatekeeper 
 For development, or a platform without a prebuilt executable. Needs [Bun](https://bun.sh).
 
 ```bash
-git clone https://github.com/Cnyn0403/claude-discord-sync.git
+git clone https://github.com/numb747/claude-discord-sync.git
 cd claude-discord-sync
-bun install
+bun install --frozen-lockfile
 bun src/cli.ts setup        # same wizard; ccd then points at bin/ccd in this checkout
 ```
 
@@ -121,7 +126,7 @@ What works, and how:
 | Permission prompts | Buttons: *Allow*, *Always allow* (adds the rule the terminal offers as "don't ask again"), *Deny*, *Deny and say why*. The terminal shows the same dialog at the same time; whichever side answers first wins, and the card on Discord closes when it's answered locally |
 | Questions (AskUserQuestion) | Select menus, as before, with the terminal dialog open at the same time |
 | Plans (ExitPlanMode) | *Approve · auto-accept edits*, *Approve · review edits* (these press the matching option in the terminal, because Claude Code ignores a hook's approval of a plan) and *Revise* (feedback goes back to Claude) |
-| Any other dialog | After 3 s of waiting with no card, a snapshot of the screen is posted with its numbered options as buttons, plus *Esc*. This also covers sessions started with plain `claude` |
+| Any other dialog | After 3 s of waiting with no card (8 s for `ccd` sessions, whose hook normally reports the dialog), a snapshot of the screen is posted with its numbered options as buttons, plus *Esc*. This also covers sessions started with plain `claude` |
 | `/screen`, `/key` | See the terminal, and press keys in it (`/key 2`, `/key down down enter`, `/key esc`) for anything the buttons don't cover |
 
 Which sessions accept input is set by `tmuxInput`: every session running in tmux (default), only `ccd` sessions, or none. Sessions outside tmux stay read-only. Start sessions with `ccd` inside tmux for the full set (prompt cards, `send_file`); plain `claude` in tmux gets chat, screen snapshots and `/key`.
@@ -262,10 +267,10 @@ Environment variable `DISCORD_SYNC_ASK_TIMEOUT` (seconds, default 600) sets how 
 | Local → Discord | Tails `~/.claude/projects/<dir>/<session>.jsonl` and renders user prompts, replies and tool calls (`src/render.ts`) |
 | Discord → local | Pasted into the session's tmux pane (`src/terminal.ts`) after checking that its input line is showing and empty. With `"channels": true`, `ccd` loads `channel-server.ts` as a Claude Code channel instead; messages arrive as `<channel source="discord-sync">` |
 | Permissions | A `PermissionRequest` hook (`src/perm-hook.ts`) asks the daemon, which posts buttons; the decision it prints closes the terminal dialog too. When the terminal answers first, the daemon sees the session stop waiting and ends the hook. With channels, the channel's permission relay posts them |
-| Other dialogs | The daemon reads the tmux screen when a session has been waiting for 3 s, parses the numbered options and presses the one you pick |
+| Other dialogs | The daemon reads the tmux screen when a session has been waiting for 3 s (8 s for `ccd` sessions), parses the numbered options and presses the one you pick |
 | Questions and plans | A `PreToolUse` hook (`src/ask-hook.ts`) on `AskUserQuestion` and `ExitPlanMode` asks the daemon, which posts components and returns the answer through `updatedInput.answers`, or allow / deny with feedback |
 | Interrupt | tmux `send-keys Escape` when the session runs in tmux; otherwise the channel server types Esc into Claude Code's terminal with `TIOCSTI`. If neither works, `src/stop-hook.ts` stops Claude before its next tool call |
-| New / resume | `tmux new-session` running `ccd`; startup dialogs (development channel, folder trust) are accepted automatically, and the last screen is posted if startup fails |
+| New / resume | `tmux new-session` running `ccd`; startup dialogs (folder trust, and the development channel with `"channels": true`) are accepted automatically, and the last screen is posted if startup fails |
 | Deleted channels | A deleted live channel is recreated with a backlog. A deleted ended channel removes the session from the lists |
 
 ## Security
