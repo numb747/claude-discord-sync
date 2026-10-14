@@ -91,6 +91,8 @@ flowchart LR
 
 The setup wizard prints the invite link with every permission the bot needs. That includes **Manage Channels**, and **Manage Roles**, which is what makes session channels visible to you only.
 
+4. **Set the server's notifications to *Only @mentions*** (long-press or right-click the server → *Notification Settings*). Cards that need you and "Claude is done" @-mention you, so the rest of the mirror stays quiet.
+
 ### 2. Dependencies and the wizard
 
 You need [Bun](https://bun.sh) (on Arch / CachyOS: `sudo pacman -S bun`), tmux and git.
@@ -159,7 +161,25 @@ A channel named `project・title` appears under *Claude Sessions*. Its first mes
 | 📋 Plan awaiting approval | Claude calls ExitPlanMode | *Approve · auto-accept edits*, *Approve · review edits*, *Revise* |
 | ⏸️ Claude is waiting on the terminal | Any other dialog, including in sessions started with plain `claude`, after 3 s of waiting (8 s for `ccd` sessions) | One button per numbered option, plus *Esc* |
 
-When a card closes, it records how it was answered: "✅ Allowed (name)", "-# ⌨️ Answered in the terminal" or "-# ✔️ The dialog is gone".
+A card's colour says where it stands:
+
+- 🟨 yellow: waiting for you;
+- 🟩 green: allowed or answered;
+- 🟥 red: denied;
+- 🟦 blue: plan sent back for revision;
+- ⬜ grey: answered in the terminal, timed out, or gone.
+
+When a card closes, its buttons go away and it records the outcome, e.g. "✅ Allowed (name)".
+
+Permission cards show what the tool will do:
+
+- Bash: the command;
+- Write: the file and the start of its content;
+- Edit: a diff;
+- web tools: the URL;
+- MCP tools: the server and the arguments.
+
+The mirror also rewrites Markdown that Discord can't show. Tables become lists, headings below `###` become bold lines, and horizontal rules are dropped. Code blocks are left as they are.
 
 ## Rules for messages from Discord
 

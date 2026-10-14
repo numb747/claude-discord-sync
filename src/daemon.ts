@@ -20,6 +20,7 @@ import {
   TextInputStyle,
   PermissionFlagsBits,
   OverwriteType,
+  EmbedBuilder,
   type Guild,
   type TextChannel,
   type AnyThreadChannel,
@@ -54,6 +55,8 @@ import { IS_WIN, IS_LINUX, hasTmux, parentPid } from './platform'
 import { COMPILED, selfCommand } from './self'
 import { daemonRunning } from './autostart'
 import { keysToTmux, type Key } from './keys'
+import { cardEmbed, toolPreview, type Card, type CardState } from './cards'
+import { discordify } from './markdown'
 import { capture, dialogOptions, leaveCopyMode, parseKeys, pasteAndSubmit, promptOf, screenTail, tmux, type DialogOption, type Pane } from './terminal'
 
 const cfg = loadConfig()
@@ -93,6 +96,8 @@ type SessionState = {
   meetings?: Meeting[]
   /** The live "working…" message while Claude is busy, kept so a restarted daemon can remove it. */
   statusMessageId?: string
+  /** The Claude Code PID whose "connected" note was posted, so daemon restarts don't repeat it. */
+  announcedPid?: number
 }
 
 /** A discussion thread under the session channel. Its record lives in meetings/<session>/<threadId>.{md,jsonl}. */
@@ -208,6 +213,10 @@ type Tracked = {
   typed?: { text: string; at: number }[]
   /** A dialog was just answered from Discord: no screen card until then, while the terminal catches up. */
   quietUntil?: number
+  /** The latest tool call read from the transcript (toolKey), and the post of what was read with it. */
+  lastToolUse?: string
+  lastToolUseAt?: number
+  posting?: Promise<void>
 }
 const tracked = new Map<string, Tracked>()
 const creating = new Set<string>()
@@ -396,6 +405,7 @@ async function startTracking(s: LiveSession) {
     t.st.ended = false
     t.st.endedAt = undefined
     await post(t, [headerFor(t)])
+    if (peers.has(s.pid)) t.st.announcedPid = s.pid
     if (transcript) {
       // Session predates the channel: show only the tail of its history.
       const tail = new JsonlTail(transcript)
@@ -425,7 +435,7 @@ async function startTracking(s: LiveSession) {
 async function endTracking(t: Tracked) {
   const card = dialogs.get(t.sessionId)
   if (card) closeDialogCard(t.sessionId, card, m.dialogClosed)
-  pump(t)
+  await pump(t).catch(() => {})
   // Nobody can hand an open meeting to an ended session; keep its record.
   await closeMeeting(t, { handoff: false })
   await refreshStatus(t, false).catch(() => {})
@@ -551,7 +561,8 @@ async function onChannelGone(id: string) {
 client.on('channelDelete', ch => void onChannelGone(ch.id).catch(e => log('channelDelete failed:', e?.message ?? e)))
 client.on('threadDelete', th => void onChannelGone(th.id).catch(e => log('threadDelete failed:', e?.message ?? e)))
 
-function pump(t: Tracked) {
+/** Post what the transcript has gained; the promise settles once it's sent. */
+async function pump(t: Tracked): Promise<void> {
   if (!t.tail) {
     const p = findTranscript(t.sessionId, t.st.cwd)
     if (!p) return
@@ -577,14 +588,55 @@ function pump(t: Tracked) {
     return
   }
   noteLastPrompt(t, blocks)
-  if (blocks.length) void post(t, pack(blocks, cfg.attachOver))
+  if (!blocks.length) return
+  const sent = (t.posting = post(t, pack(blocks, cfg.attachOver)))
+  await sent
+}
+
+/**
+ * A tool call's identity for matching the hook's copy to the transcript's: key
+ * order and defaulted fields (`replace_all: false`) differ between the two.
+ */
+function toolKey(name: string, input: unknown): string {
+  const obj = (input ?? {}) as Record<string, unknown>
+  const fields = Object.keys(obj)
+    .filter(k => obj[k] !== false && obj[k] !== null && obj[k] !== undefined)
+    .sort()
+    .map(k => [k, obj[k]])
+  return `${name}\0${JSON.stringify(fields)}`
+}
+/** How long a card may wait for the transcript to show the tool call it's about. */
+const CATCH_UP_MS = 3000
+
+/**
+ * Before a card about a tool call: wait until the transcript has that call and
+ * post what came before it (Claude's "I'll now …"), so the card comes after it,
+ * as in the terminal. Claude Code writes the transcript a moment after it asks.
+ */
+async function catchUp(t: Tracked, tool: string, input?: unknown) {
+  // Without the input (questions and plans reach us reshaped), the tool's name has to do.
+  // An identical call read well before this request was an earlier one.
+  const since = Date.now() - CATCH_UP_MS
+  const seen = () =>
+    (t.lastToolUseAt ?? 0) >= since &&
+    (input === undefined ? !!t.lastToolUse?.startsWith(`${tool}\0`) : t.lastToolUse === toolKey(tool, input))
+  const deadline = Date.now() + CATCH_UP_MS
+  while (!seen() && Date.now() < deadline) {
+    await pump(t).catch(() => {})
+    if (!seen()) await Bun.sleep(200)
+  }
+  await t.posting?.catch(() => {})
 }
 
 /** Follow the main thread's tool calls: a tool_use starts one, its result (or new text) ends it. */
 function trackActivity(t: Tracked, o: any) {
   if (o?.isSidechain || !Array.isArray(o?.message?.content)) return
   for (const item of o.message.content) {
-    if (o.type === 'assistant' && item?.type === 'tool_use') t.activity = { label: toolLabel(item.name, item.input), since: Date.now() }
+    if (o.type === 'assistant' && item?.type === 'tool_use') {
+      t.activity = { label: toolLabel(item.name, item.input), since: Date.now() }
+      t.lastToolUse = toolKey(item.name, item.input)
+      t.lastToolUseAt = Date.now()
+    }
     else if ((o.type === 'assistant' && item?.type === 'text') || (o.type === 'user' && item?.type === 'tool_result')) t.activity = undefined
   }
 }
@@ -678,13 +730,20 @@ function notifyWhenDone(t: Tracked) {
   // A pending question already pinged them.
   if ([...asks.values(), ...plans.values(), ...perms.values()].some(a => a.channelId === t.st.channelId)) return
   const who = audience(t.st, 'chat')
-  void channelOf(t).then(ch => {
+  // Claude Code can say "idle" a moment before the turn's last reply reaches the
+  // transcript: wait, post that reply, then the notification under it.
+  setTimeout(async () => {
+    await pump(t).catch(() => {})
+    // Things may have moved on in the meantime: paused, working again, or asking something.
+    if (isPaused(t.st) || t.live?.status !== 'idle' || t.busySince !== undefined) return
+    if ([...asks.values(), ...plans.values(), ...perms.values()].some(a => a.channelId === t.st.channelId)) return
+    const ch = await channelOf(t)
     if (!ch) return
-    void enqueue(ch.id, () =>
-      ch.send({ content: `${mentionsOf(who)} ${m.done(formatDuration(elapsed))}`, allowedMentions: { users: who } }),
-    )
-  })
+    void enqueue(ch.id, () => ch.send({ content: `${mentionsOf(who)} ${m.done(formatDuration(elapsed))}`, allowedMentions: { users: who } }))
+  }, DONE_AFTER_MS)
 }
+
+const DONE_AFTER_MS = 2000
 
 let ticking = false
 async function tick() {
@@ -713,7 +772,7 @@ async function tick() {
         await endTracking(t).catch(e => log('end failed:', e?.message ?? e))
         continue
       }
-      pump(t)
+      void pump(t)
       void syncChannel(t.sessionId, t.st)
       warnContext(t)
       notifyWhenDone(t)
@@ -974,7 +1033,7 @@ client.on('interactionCreate', async (i: Interaction) => {
   }
   if (i.isChatInputCommand() && (COMMANDS as readonly string[]).includes(i.commandName)) {
     if (!can(i.user.id, sessionByChannel(i.channelId), i.commandName === 'stop' ? 'chat' : 'owner')) {
-      await i.reply({ content: m.notAuthorized, ephemeral: true }).catch(() => {})
+      await i.reply({ content: m.notAuthorized, flags: MessageFlags.Ephemeral }).catch(() => {})
       return
     }
     await i.deferReply()
@@ -988,7 +1047,7 @@ client.on('interactionCreate', async (i: Interaction) => {
   }
   if (i.isButton() && i.customId.startsWith('resume:')) {
     if (!isOwner(i.user.id)) {
-      await i.reply({ content: m.notAuthorized, ephemeral: true }).catch(() => {})
+      await i.reply({ content: m.notAuthorized, flags: MessageFlags.Ephemeral }).catch(() => {})
       return
     }
     const sid = i.customId.slice('resume:'.length)
@@ -1025,18 +1084,34 @@ client.on('interactionCreate', async (i: Interaction) => {
   if (!match) return
   const [, behavior, pid, request_id] = match
   if (!can(i.user.id, trackedByPid(Number(pid))?.st, 'approve')) {
-    await i.reply({ content: m.notAuthorized, ephemeral: true }).catch(() => {})
+    await i.reply({ content: m.notAuthorized, flags: MessageFlags.Ephemeral }).catch(() => {})
     return
   }
   const peer = peers.get(Number(pid))
   if (!peer) {
-    await i.reply({ content: m.sessionDisconnected, ephemeral: true }).catch(() => {})
+    await i.reply({ content: m.sessionDisconnected, flags: MessageFlags.Ephemeral }).catch(() => {})
     return
   }
   ipcSend(peer, { t: 'permission', request_id, behavior: behavior as 'allow' | 'deny' })
   const label = behavior === 'allow' ? m.allowed : m.denied
-  await i.update({ content: `${i.message.content}\n\n**${label}**（${i.user.username}）`, components: [] }).catch(() => {})
+  const status = `**${label}**（${i.user.username}）`
+  const card = channelCards.get(request_id)
+  channelCards.delete(request_id)
+  await i
+    .update(
+      card
+        ? { content: '', embeds: [cardEmbed(card, behavior === 'allow' ? 'approved' : 'denied', status)], components: [] }
+        : { content: `${i.message.content}\n\n${status}`, components: [] },
+    )
+    .catch(() => {})
 })
+
+/**
+ * With channels: the cards of permission prompts relayed by the channel, by request ID, to
+ * redraw them once answered. The channel's relay gives no sign of a prompt answered in the
+ * terminal, so the map keeps the latest 100.
+ */
+const channelCards = new Map<string, Card>()
 
 // ---- AskUserQuestion on Discord --------------------------------------------
 
@@ -1063,8 +1138,10 @@ function askContent(a: PendingAsk, footer?: string): string {
     const ans = a.answers[i]
     return `**❓ ${n > 1 ? `(${i + 1}) ` : ''}${q.question}**${q.multiSelect ? m.multiSelect : ''}\n${opts}${ans !== undefined ? `\n↳ ✅ **${ans}**` : ''}`
   })
-  return clip([...parts, footer].filter(Boolean).join('\n\n'), 2000)
+  return clip([...parts, footer].filter(Boolean).join('\n\n'), 3800)
 }
+
+const askCard = (a: PendingAsk): Card => ({ title: m.questionCardTitle, body: askContent(a) })
 
 function askComponents(key: string, a: PendingAsk) {
   const rows = a.questions.map((q, i) => {
@@ -1107,17 +1184,22 @@ async function startAsk(sock: Socket, sessionId: string, questions: AskQuestion[
     asks.delete(key)
     // Racing, the hook only goes away early because the terminal took the dialog (Esc ends it).
     if (a.messageId)
-      void ch.messages.edit(a.messageId, { content: askContent(a, racing ? m.handledInTerminal : m.timedOut), components: [] }).catch(() => {})
+      void ch.messages
+        .edit(a.messageId, { content: '', embeds: [cardEmbed(askCard(a), 'closed', racing ? m.handledInTerminal : m.timedOut)], components: [] })
+        .catch(() => {})
   })
   if (racing)
     race(sock, sessionId, () => {
       asks.delete(key)
-      if (a.messageId) void ch.messages.edit(a.messageId, { content: askContent(a, m.handledInTerminal), components: [] }).catch(() => {})
+      if (a.messageId)
+        void ch.messages.edit(a.messageId, { content: '', embeds: [cardEmbed(askCard(a), 'closed', m.handledInTerminal)], components: [] }).catch(() => {})
     })
+  await catchUp(t, 'AskUserQuestion')
   const who = audience(t.st, 'chat')
   const sent = await enqueue(ch.id, () =>
     ch.send({
-      content: clip(`${mentionsOf(who)}\n${askContent(a)}`, 2000),
+      content: mentionsOf(who),
+      embeds: [cardEmbed(askCard(a), 'pending')],
       components: askComponents(key, a),
       allowedMentions: { users: who },
     }),
@@ -1131,20 +1213,20 @@ async function handleAskInteraction(i: ButtonInteraction | StringSelectMenuInter
   const [, kind, key, qs] = match
   const a = asks.get(key)
   if (!can(i.user.id, trackedByChannel(a?.channelId ?? i.channelId ?? '')?.st, 'chat')) {
-    await i.reply({ content: m.notAuthorized, ephemeral: true })
+    await i.reply({ content: m.notAuthorized, flags: MessageFlags.Ephemeral })
     return
   }
   if (!a) {
-    await i.reply({ content: m.questionClosed, ephemeral: true })
+    await i.reply({ content: m.questionClosed, flags: MessageFlags.Ephemeral })
     return
   }
-  const update = (opts: { content: string; components: any[] }) =>
+  const update = (opts: { content?: string; embeds: EmbedBuilder[]; components: any[] }) =>
     i.isModalSubmit() ? (i.isFromMessage() ? i.update(opts) : i.reply(opts)) : i.update(opts)
   const settle = (answers: Record<string, string> | undefined, footer: string) => {
     asks.delete(key)
     answeredRemotely(a.sock)
     ipcSend(a.sock, { t: 'ask_result', answers })
-    return update({ content: askContent(a, footer), components: [] })
+    return update({ content: '', embeds: [cardEmbed(askCard(a), answers ? 'approved' : 'closed', footer)], components: [] })
   }
 
   if (kind === 'term') {
@@ -1185,14 +1267,14 @@ async function handleAskInteraction(i: ButtonInteraction | StringSelectMenuInter
     const answers = Object.fromEntries(a.questions.map((q, j) => [q.question, a.answers[j]!]))
     await settle(answers, m.answeredBy(i.user.username))
   } else {
-    await update({ content: askContent(a), components: askComponents(key, a) })
+    await update({ embeds: [cardEmbed(askCard(a), 'pending')], components: askComponents(key, a) })
   }
 }
 
 // ---- ExitPlanMode on Discord ----------------------------------------------
 
 /** racing: also shown in the terminal (perm-hook.ts); approving then presses the terminal dialog's option. */
-type PendingPlan = { sock: Socket; sessionId: string; channelId: string; messageId?: string; content: string; racing: boolean }
+type PendingPlan = { sock: Socket; sessionId: string; channelId: string; messageId?: string; card: Card; racing: boolean }
 const plans = new Map<string, PendingPlan>()
 
 async function startPlan(sock: Socket, sessionId: string, plan: string, racing = false) {
@@ -1204,21 +1286,29 @@ async function startPlan(sock: Socket, sessionId: string, plan: string, racing =
   }
   const key = Math.random().toString(36).slice(2, 10)
   const who = audience(t.st, 'approve')
-  const full = `${m.planPending}\n${plan}`
-  // Long plans: preview in the message, full text attached.
-  const long = full.length > 1800
-  const p: PendingPlan = { sock, sessionId, channelId: ch.id, content: long ? chunk(full, 1700)[0] + '\n' + m.planAttached : full, racing }
+  const body = discordify(plan)
+  // Long plans: preview in the card, full text attached.
+  const long = body.length > 3500
+  const p: PendingPlan = {
+    sock,
+    sessionId,
+    channelId: ch.id,
+    card: { title: m.planPending, body: long ? chunk(body, 3400)[0] + '\n\n' + m.planAttached : body },
+    racing,
+  }
   plans.set(key, p)
+  const close = (footer: string) => {
+    if (p.messageId) void ch.messages.edit(p.messageId, { content: '', embeds: [cardEmbed(p.card, 'closed', footer)], components: [] }).catch(() => {})
+  }
   sock.on('close', () => {
     if (plans.get(key) !== p) return
     plans.delete(key)
-    const footer = racing ? m.handledInTerminal : m.timedOut
-    if (p.messageId) void ch.messages.edit(p.messageId, { content: `${p.content}\n\n${footer}`, components: [] }).catch(() => {})
+    close(racing ? m.handledInTerminal : m.timedOut)
   })
   if (racing)
     race(sock, sessionId, () => {
       plans.delete(key)
-      if (p.messageId) void ch.messages.edit(p.messageId, { content: `${p.content}\n\n${m.handledInTerminal}`, components: [] }).catch(() => {})
+      close(m.handledInTerminal)
     })
   // Racing: the terminal shows the dialog anyway, and it offers both ways of approving.
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -1234,9 +1324,11 @@ async function startPlan(sock: Socket, sessionId: string, plan: string, racing =
           new ButtonBuilder().setCustomId(`plan:term:${key}`).setLabel(m.answerInTerminal).setEmoji('⌨️').setStyle(ButtonStyle.Secondary),
         ]),
   )
+  await catchUp(t, 'ExitPlanMode')
   const sent = await enqueue(ch.id, () =>
     ch.send({
-      content: `${mentionsOf(who)}\n${p.content}`.slice(0, 2000),
+      content: mentionsOf(who),
+      embeds: [cardEmbed(p.card, 'pending')],
       components: [row],
       files: long ? [new AttachmentBuilder(Buffer.from(plan, 'utf8'), { name: 'plan.md' })] : [],
       allowedMentions: { users: who },
@@ -1251,11 +1343,11 @@ async function handlePlanInteraction(i: ButtonInteraction | ModalSubmitInteracti
   const [, action, key] = match
   const p = plans.get(key)
   if (!can(i.user.id, trackedByChannel(p?.channelId ?? i.channelId ?? '')?.st, 'approve')) {
-    await i.reply({ content: m.notAuthorized, ephemeral: true })
+    await i.reply({ content: m.notAuthorized, flags: MessageFlags.Ephemeral })
     return
   }
   if (!p) {
-    await i.reply({ content: m.planHandled, ephemeral: true })
+    await i.reply({ content: m.planHandled, flags: MessageFlags.Ephemeral })
     return
   }
   if (action === 'revise') {
@@ -1277,23 +1369,27 @@ async function handlePlanInteraction(i: ButtonInteraction | ModalSubmitInteracti
     const t = tracked.get(p.sessionId)
     const want = action === 'approvem' ? /manual/i : /auto-accept/i
     const r = t ? await pressOption(t, opts => opts.find(o => want.test(o.label)) ?? opts.find(o => /^yes/i.test(o.label))) : { error: m.sessionNotFound }
-    if (r.error) return void (await i.reply({ content: m.cantApproveRemotely(r.error), ephemeral: true }))
+    if (r.error) return void (await i.reply({ content: m.cantApproveRemotely(r.error), flags: MessageFlags.Ephemeral }))
   }
   plans.delete(key)
   answeredRemotely(p.sock)
   let footer: string
+  let state: CardState
   if (action === 'approve' || action === 'approvem') {
     ipcSend(p.sock, { t: 'plan_result', approved: true })
     footer = m.approvedBy(i.user.username)
+    state = 'approved'
   } else if (action === 'term') {
     ipcSend(p.sock, { t: 'ask_result' })
     footer = m.answeringInTerminal(i.user.username)
+    state = 'closed'
   } else {
     const feedback = (i as ModalSubmitInteraction).fields.getTextInputValue('text').trim()
     ipcSend(p.sock, { t: 'plan_result', approved: false, feedback })
     footer = `${m.revisionRequested(i.user.username)}\n${quoteLines(feedback)}`
+    state = 'revise'
   }
-  const opts = { content: `${p.content}\n\n${footer}`.slice(0, 2000), components: [] }
+  const opts = { content: '', embeds: [cardEmbed(p.card, state, footer)], components: [] }
   if (i.isModalSubmit() && !i.isFromMessage()) await i.reply(opts)
   else await (i as ButtonInteraction).update(opts)
 }
@@ -1370,7 +1466,7 @@ type PendingPerm = {
   sock: Socket
   channelId: string
   messageId?: string
-  content: string
+  card: Card
   suggestions?: unknown[]
   /** Retired before its message was sent. */
   closed?: string
@@ -1394,12 +1490,6 @@ function suggestedRules(suggestions: unknown[] | undefined): string[] {
   )
 }
 
-/** What the tool is about to do: the command for Bash and the like, otherwise its input as JSON. */
-function toolPreview(input: Record<string, unknown>): string {
-  const fence = (lang: string, s: string) => '```' + lang + '\n' + clip(s, 1200).replace(/```/g, 'ˋˋˋ') + '\n```'
-  return typeof input.command === 'string' ? fence('bash', input.command) : fence('json', JSON.stringify(input, null, 2))
-}
-
 async function startPerm(sock: Socket, msg: Extract<ClientMsg, { t: 'perm' }>) {
   const t = tracked.get(msg.sessionId)
   const ch = t && (await channelOf(t))
@@ -1407,20 +1497,23 @@ async function startPerm(sock: Socket, msg: Extract<ClientMsg, { t: 'perm' }>) {
   if (!ch || isPaused(t.st)) return void ipcSend(sock, { t: 'perm_result' })
   const id = newPermId()
   const rules = suggestedRules(msg.suggestions)
-  const content = [
-    m.permissionNeeded(msg.toolName),
-    typeof msg.toolInput.description === 'string' ? msg.toolInput.description : '',
-    toolPreview(msg.toolInput),
+  const body = [
+    typeof msg.toolInput.description === 'string' ? `*${msg.toolInput.description}*` : '',
+    toolPreview(msg.toolName, msg.toolInput),
     rules.length ? m.alwaysAllowRules(clip(rules.join(', '), 300)) : '',
-    m.permissionReplyHint(id),
   ]
     .filter(Boolean)
     .join('\n')
-  const p: PendingPerm = { sock, channelId: ch.id, content: chunk(content, 1800)[0], suggestions: msg.suggestions }
+  const p: PendingPerm = {
+    sock,
+    channelId: ch.id,
+    card: { title: m.permissionNeeded(msg.toolName), body, footer: m.permissionReplyHint(id) },
+    suggestions: msg.suggestions,
+  }
   perms.set(id, p)
   const close = (footer: string) => {
     p.closed = footer
-    if (p.messageId) void ch.messages.edit(p.messageId, { content: `${p.content}\n\n${footer}`.slice(0, 2000), components: [] }).catch(() => {})
+    if (p.messageId) void ch.messages.edit(p.messageId, { content: '', embeds: [cardEmbed(p.card, 'closed', footer)], components: [] }).catch(() => {})
   }
   sock.on('close', () => {
     if (perms.get(id) !== p) return
@@ -1438,9 +1531,10 @@ async function startPerm(sock: Socket, msg: Extract<ClientMsg, { t: 'perm' }>) {
     new ButtonBuilder().setCustomId(`ph:deny:${id}`).setLabel(m.deny).setEmoji('❌').setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId(`ph:tell:${id}`).setLabel(m.denyWithNote).setEmoji('💬').setStyle(ButtonStyle.Secondary),
   )
+  await catchUp(t, msg.toolName, msg.toolInput)
   const who = audience(t.st, 'approve')
   const sent = await enqueue(ch.id, () =>
-    ch.send({ content: `${mentionsOf(who)}\n${p.content}`.slice(0, 2000), components: [row], allowedMentions: { users: who } }),
+    ch.send({ content: mentionsOf(who), embeds: [cardEmbed(p.card, 'pending')], components: [row], allowedMentions: { users: who } }),
   )
   p.messageId = sent.id
   if (p.closed) close(p.closed)
@@ -1465,7 +1559,9 @@ async function settlePerm(id: string, action: PermAction, by: string, note?: str
   const footer = `**${label}**（${by}）${note ? '\n' + quoteLines(note) : ''}`
   const ch = guild.channels.cache.get(p.channelId)
   if (p.messageId && ch?.type === ChannelType.GuildText)
-    await ch.messages.edit(p.messageId, { content: `${p.content}\n\n${footer}`.slice(0, 2000), components: [] }).catch(() => {})
+    await ch.messages
+      .edit(p.messageId, { content: '', embeds: [cardEmbed(p.card, action === 'allow' || action === 'always' ? 'approved' : 'denied', footer)], components: [] })
+      .catch(() => {})
 }
 
 async function handlePermInteraction(i: ButtonInteraction | ModalSubmitInteraction) {
@@ -1474,11 +1570,11 @@ async function handlePermInteraction(i: ButtonInteraction | ModalSubmitInteracti
   const [, action, id] = match
   const p = perms.get(id)
   if (!can(i.user.id, sessionByChannel(p?.channelId ?? i.channelId ?? ''), 'approve')) {
-    await i.reply({ content: m.notAuthorized, ephemeral: true })
+    await i.reply({ content: m.notAuthorized, flags: MessageFlags.Ephemeral })
     return
   }
   if (!p) {
-    await i.reply({ content: m.permissionHandled, ephemeral: true })
+    await i.reply({ content: m.permissionHandled, flags: MessageFlags.Ephemeral })
     return
   }
   if (action === 'tell') {
@@ -1490,7 +1586,7 @@ async function handlePermInteraction(i: ButtonInteraction | ModalSubmitInteracti
   }
   if (i.isModalSubmit()) {
     if (i.isFromMessage()) await i.deferUpdate()
-    else await i.deferReply({ ephemeral: true })
+    else await i.deferReply({ flags: MessageFlags.Ephemeral })
     await settlePerm(id, 'tell', i.user.username, i.fields.getTextInputValue('text').trim())
     if (!i.isFromMessage()) await i.deleteReply().catch(() => {})
     return
@@ -1508,7 +1604,7 @@ async function handlePermInteraction(i: ButtonInteraction | ModalSubmitInteracti
 const DIALOG_AFTER_MS = 3000
 /** ccd sessions: their hook usually reports the dialog itself, so give it longer before posting the screen. */
 const DIALOG_AFTER_HOOKED_MS = 8000
-type DialogCard = { channelId?: string; messageId?: string; options: DialogOption[]; closed?: string }
+type DialogCard = { channelId?: string; messageId?: string; options: DialogOption[]; card?: Card; closed?: { footer: string; state: CardState } }
 /** By session ID. */
 const dialogs = new Map<string, DialogCard>()
 
@@ -1533,6 +1629,8 @@ function watchDialog(t: Tracked) {
 }
 
 async function postDialogCard(t: Tracked, pane: Pane, c: DialogCard) {
+  await pump(t).catch(() => {})
+  await t.posting?.catch(() => {})
   const screen = await capture(pane)
   c.options = dialogOptions(screen)
   const ch = await channelOf(t)
@@ -1549,25 +1647,26 @@ async function postDialogCard(t: Tracked, pane: Pane, c: DialogCard) {
   ]
   const rows = [buttons.slice(0, 5), buttons.slice(5, 10)].filter(r => r.length).map(r => new ActionRowBuilder<ButtonBuilder>().addComponents(...r))
   const who = audience(t.st, 'approve')
-  const block = '```\n' + clipStart(screenTail(screen, 25), 1500).replace(/```/g, 'ˋˋˋ') + '\n```'
+  c.card = {
+    title: m.dialogWaiting,
+    body: '```\n' + clipStart(screenTail(screen, 30), 3000).replace(/```/g, 'ˋˋˋ') + '\n```',
+    footer: m.dialogHint,
+  }
   const sent = await enqueue(ch.id, () =>
-    ch.send({ content: `${mentionsOf(who)}\n${m.dialogWaiting}\n${block}\n${m.dialogHint}`.slice(0, 2000), components: rows, allowedMentions: { users: who } }),
+    ch.send({ content: mentionsOf(who), embeds: [cardEmbed(c.card!, 'pending')], components: rows, allowedMentions: { users: who } }),
   )
   c.messageId = sent.id
-  if (c.closed) closeDialogCard(t.sessionId, c, c.closed)
+  if (c.closed) closeDialogCard(t.sessionId, c, c.closed.footer, c.closed.state)
 }
 
-function closeDialogCard(sessionId: string, c: DialogCard, footer: string) {
+function closeDialogCard(sessionId: string, c: DialogCard, footer: string, state: CardState = 'closed') {
   if (dialogs.get(sessionId) === c) dialogs.delete(sessionId)
-  c.closed = footer
+  c.closed = { footer, state }
   const ch = c.channelId ? guild.channels.cache.get(c.channelId) : undefined
-  if (!c.messageId || ch?.type !== ChannelType.GuildText) return
+  if (!c.messageId || !c.card || ch?.type !== ChannelType.GuildText) return
   const id = c.messageId
   c.messageId = undefined
-  void ch.messages
-    .fetch(id)
-    .then(msg => msg.edit({ content: `${msg.content}\n${footer}`.slice(0, 2000), components: [] }))
-    .catch(() => {})
+  void ch.messages.edit(id, { content: '', embeds: [cardEmbed(c.card, state, footer)], components: [] }).catch(() => {})
 }
 
 async function handleDialogButton(i: ButtonInteraction) {
@@ -1576,13 +1675,13 @@ async function handleDialogButton(i: ButtonInteraction) {
   const [, sid, key] = match
   const t = tracked.get(sid)
   if (!can(i.user.id, t?.st ?? sessionByChannel(i.channelId), 'approve')) {
-    await i.reply({ content: m.notAuthorized, ephemeral: true })
+    await i.reply({ content: m.notAuthorized, flags: MessageFlags.Ephemeral })
     return
   }
   const c = dialogs.get(sid)
   const pane = t?.live && tmuxPaneOf(t.live.pid)
   if (!t?.live || !c || t.live.status !== 'waiting' || !pane) {
-    await i.reply({ content: m.dialogGone, ephemeral: true })
+    await i.reply({ content: m.dialogGone, flags: MessageFlags.Ephemeral })
     return
   }
   let label = 'Esc'
@@ -1594,7 +1693,7 @@ async function handleDialogButton(i: ButtonInteraction) {
     const then = c.options.find(o => o.n === key)
     const r = await pressOption(t, now => now.find(o => o.n === key && o.label === then?.label))
     if (r.error) {
-      await i.reply({ content: m.dialogChanged, ephemeral: true })
+      await i.reply({ content: m.dialogChanged, flags: MessageFlags.Ephemeral })
       // Post the current screen instead.
       closeDialogCard(sid, c, m.dialogClosed)
       t.waitingSince = Date.now() - DIALOG_AFTER_MS
@@ -1606,7 +1705,7 @@ async function handleDialogButton(i: ButtonInteraction) {
   // Whatever comes next (another dialog) gets its own card, once this one has closed.
   t.waitingSince = undefined
   t.quietUntil = Date.now() + QUIET_AFTER_ANSWER_MS / 2
-  closeDialogCard(sid, c, `**${m.dialogAnswered(clip(label, 100))}**（${i.user.username}）`)
+  closeDialogCard(sid, c, `**${m.dialogAnswered(clip(label, 100))}**（${i.user.username}）`, 'approved')
 }
 
 // ---- /screen and /key: see and drive the terminal ----------------------------
@@ -1989,7 +2088,7 @@ function interactionReplier(i: RepliableInteraction, ephemeral = false): Replier
         await i.editReply(text)
         return { edit: t => i.editReply(t) }
       }
-      const sent = await i.followUp({ content: text, ephemeral })
+      const sent = await i.followUp({ content: text, ...(ephemeral ? { flags: MessageFlags.Ephemeral } : {}) })
       return { edit: t => i.webhook.editMessage(sent, { content: t }) }
     },
     react: () => {},
@@ -2245,7 +2344,7 @@ async function updateConsole() {
 
 async function handleConsoleInteraction(i: ButtonInteraction | StringSelectMenuInteraction | ModalSubmitInteraction) {
   if (!isOwner(i.user.id)) {
-    await i.reply({ content: m.notAuthorized, ephemeral: true })
+    await i.reply({ content: m.notAuthorized, flags: MessageFlags.Ephemeral })
     return
   }
   if (i.isButton() && i.customId === 'console:new') {
@@ -2264,7 +2363,7 @@ async function handleConsoleInteraction(i: ButtonInteraction | StringSelectMenuI
     )
     return
   }
-  await i.deferReply({ ephemeral: true })
+  await i.deferReply({ flags: MessageFlags.Ephemeral })
   const r = interactionReplier(i, true)
   if (i.isButton() && (i.customId === 'console:pauseall' || i.customId === 'console:resumeall')) {
     await setAllPaused(i.customId === 'console:pauseall', i.user.username)
@@ -3011,14 +3110,14 @@ async function handleHandoffButton(i: ButtonInteraction) {
   const [, action, sid, ts] = i.customId.split(':')
   const st = state.sessions[sid]
   if (action === 'make') {
-    if (!st || !can(i.user.id, st, 'chat')) return void (await i.reply({ content: m.notAuthorized, ephemeral: true }))
+    if (!st || !can(i.user.id, st, 'chat')) return void (await i.reply({ content: m.notAuthorized, flags: MessageFlags.Ephemeral }))
     await i.deferReply()
     await makeHandoff(interactionReplier(i), st.channelId, undefined)
     return
   }
   // Starting and ending sessions is for owners, as with /new and /end.
-  if (!isOwner(i.user.id)) return void (await i.reply({ content: m.notAuthorized, ephemeral: true }))
-  if (!st) return void (await i.reply({ content: m.sessionNotFound, ephemeral: true }))
+  if (!isOwner(i.user.id)) return void (await i.reply({ content: m.notAuthorized, flags: MessageFlags.Ephemeral }))
+  if (!st) return void (await i.reply({ content: m.sessionNotFound, flags: MessageFlags.Ephemeral }))
   await i.deferReply()
   const r = interactionReplier(i)
   if (action === 'end') {
@@ -3087,18 +3186,18 @@ async function handleSessionCommand(i: import('discord.js').ChatInputCommandInte
   const st = sessionByChannel(i.channelId)
   if (i.commandName === 'usage') {
     // Only the asker sees it; plan usage is the owner's account, so others only get the session's numbers.
-    if (!isOwner(i.user.id) && !can(i.user.id, st, 'view')) return void (await i.reply({ content: m.notAuthorized, ephemeral: true }))
-    await i.reply({ content: clip(usageReport(i.channelId, isOwner(i.user.id)), 2000), ephemeral: true, allowedMentions: { parse: [] } })
+    if (!isOwner(i.user.id) && !can(i.user.id, st, 'view')) return void (await i.reply({ content: m.notAuthorized, flags: MessageFlags.Ephemeral }))
+    await i.reply({ content: clip(usageReport(i.channelId, isOwner(i.user.id)), 2000), flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } })
     return
   }
   const need: Need = i.commandName === 'members' ? 'view' : i.commandName === 'rename' || i.commandName === 'handoff' ? 'chat' : 'owner'
   if (!can(i.user.id, st, need) && !(i.commandName === 'sync' && isOwner(i.user.id))) {
-    await i.reply({ content: m.notAuthorized, ephemeral: true })
+    await i.reply({ content: m.notAuthorized, flags: MessageFlags.Ephemeral })
     return
   }
   if (i.commandName === 'members') {
-    if (!st) return void (await i.reply({ content: m.notSessionChannel, ephemeral: true }))
-    await i.reply({ content: memberList(st), ephemeral: true, allowedMentions: { parse: [] } })
+    if (!st) return void (await i.reply({ content: m.notSessionChannel, flags: MessageFlags.Ephemeral }))
+    await i.reply({ content: memberList(st), flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } })
     return
   }
   await i.deferReply()
@@ -3350,7 +3449,11 @@ async function handlePeer(sock: Socket, msg: ClientMsg, self: { pid?: number }) 
     else peerTmux.delete(msg.claudePid)
     log(`channel server connected for pid ${msg.claudePid}`)
     const t = trackedByPid(msg.claudePid)
-    if (t) await post(t, [cfg.channels ? m.channelConnected : m.hooksConnected])
+    if (t && t.st.announcedPid !== msg.claudePid) {
+      t.st.announcedPid = msg.claudePid
+      stateDirty = true
+      await post(t, [cfg.channels ? m.channelConnected : m.hooksConnected])
+    }
     return
   }
   const t = self.pid ? trackedByPid(self.pid) : undefined
@@ -3359,26 +3462,31 @@ async function handlePeer(sock: Socket, msg: ClientMsg, self: { pid?: number }) 
     if (!t || isPaused(t.st)) return
     const ch = await channelOf(t)
     if (!ch) return
-    let preview = msg.input_preview
+    // The channel's relay sends the input as a (possibly truncated) JSON preview.
+    let input: Record<string, unknown> | undefined
     try {
-      preview = JSON.stringify(JSON.parse(preview), null, 2)
+      input = JSON.parse(msg.input_preview)
     } catch {}
-    const body = chunk(
-      [
-        m.permissionNeeded(msg.tool_name),
-        msg.description,
-        '```json\n' + preview.slice(0, 1200) + '\n```',
-        m.permissionReplyHint(msg.request_id),
-      ].join('\n'),
-    )[0]
+    const card: Card = {
+      title: m.permissionNeeded(msg.tool_name),
+      body: [
+        msg.description ? `*${msg.description}*` : '',
+        input ? toolPreview(msg.tool_name, input) : '```json\n' + msg.input_preview.slice(0, 1200).replace(/```/g, 'ˋˋˋ') + '\n```',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      footer: m.permissionReplyHint(msg.request_id),
+    }
+    channelCards.set(msg.request_id, card)
+    // Prompts answered elsewhere never get removed: keep only the latest.
+    if (channelCards.size > 100) channelCards.delete(channelCards.keys().next().value!)
     const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder().setCustomId(`perm:allow:${self.pid}:${msg.request_id}`).setLabel(m.allow).setEmoji('✅').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId(`perm:deny:${self.pid}:${msg.request_id}`).setLabel(m.deny).setEmoji('❌').setStyle(ButtonStyle.Danger),
     )
+    await catchUp(t, msg.tool_name, input)
     const who = audience(t.st, 'approve')
-    await enqueue(ch.id, () =>
-      ch.send({ content: `${mentionsOf(who)}\n${body}`.slice(0, 2000), components: [row], allowedMentions: { users: who } }),
-    )
+    await enqueue(ch.id, () => ch.send({ content: mentionsOf(who), embeds: [cardEmbed(card, 'pending')], components: [row], allowedMentions: { users: who } }))
     return
   }
   if (msg.t === 'send_file') {

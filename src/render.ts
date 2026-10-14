@@ -6,6 +6,7 @@
 
 /** `plain` is the unformatted text of a user message, used to label sessions. */
 import { m } from './i18n'
+import { discordify } from './markdown'
 
 export type Block = { kind: 'user' | 'assistant' | 'tool' | 'question' | 'info'; text: string; plain?: string }
 
@@ -54,6 +55,8 @@ function renderUserText(raw: string): Block | undefined {
   if (bash) return { kind: 'info', text: `-# 💻 ${code('! ' + bash[1])}` }
   const text = stripNoise(raw)
   if (!text) return undefined
+  // Claude Code records Esc / a refused tool as a user message; it's not something anyone typed.
+  if (/^\[Request interrupted by user[^\]]*\]$/.test(text)) return { kind: 'info', text: m.interruptedNote }
   return { kind: 'user', text: `${m.localInput}\n${quote(text)}`, plain: text }
 }
 
@@ -70,7 +73,7 @@ function summarizeTool(name: string, input: any, ctx: RenderContext): Block | un
   }
   if (name === 'ExitPlanMode' && typeof input?.plan === 'string') {
     if (ctx.askOnDiscord) return undefined
-    return { kind: 'question', text: `${m.planPending}\n${input.plan}` }
+    return { kind: 'question', text: `${m.planPending}\n${discordify(input.plan)}` }
   }
   // Our own tools post their own output.
   if (name.startsWith('mcp__discord-sync__')) return undefined
@@ -82,9 +85,12 @@ export function toolLabel(name: string, input: any): string {
   input ??= {}
   let detail = ''
   switch (name) {
-    case 'Bash':
-      detail = code(input.command ?? '')
+    case 'Bash': {
+      // A heredoc or script: its first line says what it is, the rest would only be cut off.
+      const lines = String(input.command ?? '').trim().split('\n')
+      detail = code(lines[0]) + (lines.length > 1 ? ` ${m.moreLines(lines.length)}` : '')
       break
+    }
     case 'Read':
     case 'Write':
     case 'Edit':
@@ -151,7 +157,7 @@ export function renderRecord(o: any, ctx: RenderContext): Block[] {
     const out: Block[] = []
     for (const item of msg.content) {
       if (item?.type === 'text' && item.text?.trim()) {
-        out.push({ kind: 'assistant', text: item.text.trim() })
+        out.push({ kind: 'assistant', text: discordify(item.text.trim()) })
       } else if (item?.type === 'tool_use') {
         ctx.toolNames.set(item.id, item.name)
         const b = summarizeTool(item.name, item.input, ctx)
