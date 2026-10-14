@@ -19,6 +19,7 @@ import {
   TextInputBuilder,
   TextInputStyle,
   PermissionFlagsBits,
+  OverwriteType,
   type Guild,
   type TextChannel,
   type AnyThreadChannel,
@@ -1845,6 +1846,11 @@ const BOT_ALLOW = {
   AddReactions: true,
   EmbedLinks: true,
 }
+// A bare user ID only resolves if that user is in the client cache, which the
+// Guilds intent doesn't fill; without an explicit type discord.js throws
+// "Supplied parameter is not a User nor a Role".
+const AS_MEMBER = { type: OverwriteType.Member }
+
 function memberPerms(role: Role) {
   const act = role !== 'viewer'
   return { ViewChannel: true, ReadMessageHistory: true, SendMessages: act, SendMessagesInThreads: act, AddReactions: act, AttachFiles: act }
@@ -1858,7 +1864,7 @@ function sessionByChannel(channelId: string): SessionState | undefined {
 async function applyMembers(ch: TextChannel, st: SessionState) {
   if (!canManageRoles) return
   for (const [id, role] of Object.entries(st.members ?? {})) {
-    await ch.permissionOverwrites.edit(id, memberPerms(role)).catch(e => log(`member overwrite for ${id} failed:`, e?.message))
+    await ch.permissionOverwrites.edit(id, memberPerms(role), AS_MEMBER).catch(e => log(`member overwrite for ${id} failed:`, e?.message))
   }
 }
 
@@ -1878,8 +1884,8 @@ async function lockDown() {
     if (cat?.type !== ChannelType.GuildCategory) continue
     try {
       // Bot first, or denying @everyone could lock the bot out of its own category.
-      await cat.permissionOverwrites.edit(client.user!.id, BOT_ALLOW)
-      for (const owner of cfg.allowFrom) await cat.permissionOverwrites.edit(owner, OWNER_ALLOW)
+      await cat.permissionOverwrites.edit(client.user!.id, BOT_ALLOW, AS_MEMBER)
+      for (const owner of cfg.allowFrom) await cat.permissionOverwrites.edit(owner, OWNER_ALLOW, AS_MEMBER)
       await cat.permissionOverwrites.edit(guild.roles.everyone, { ViewChannel: false })
       for (const child of cat.children.cache.values()) {
         if (child.permissionsLocked) continue
@@ -1902,7 +1908,7 @@ async function share(r: Replier, channelId: string, userId: string, role: Role |
   if (!canManageRoles) return void (await r.reply(m.needManageRoles))
   if (isOwner(userId)) return void (await r.reply(m.alreadyOwner))
   if (role) {
-    await ch.permissionOverwrites.edit(userId, memberPerms(role))
+    await ch.permissionOverwrites.edit(userId, memberPerms(role), AS_MEMBER)
     st.members = { ...st.members, [userId]: role }
     await r.reply(m.shared(userId, roleName(role)))
   } else {
