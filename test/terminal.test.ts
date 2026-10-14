@@ -1,6 +1,7 @@
 /**
  * Screen parsing against real Claude Code 2.1.273 screens captured from tmux
- * (fixtures/*.txt plain, *.ansi with `capture-pane -e`). Run with `bun test`.
+ * (fixtures/*.txt plain, *.ansi with `capture-pane -e`), and 2.1.299 screens
+ * (*-cursor.ansi) with tmux's cursor position. Run with `bun test`.
  */
 import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'fs'
@@ -18,6 +19,20 @@ describe('promptOf', () => {
   })
   test('no input line while a dialog is open', () => {
     expect(promptOf(fx('perm.ansi'))).toBeUndefined()
+  })
+  test('2.1.299: empty input line, hint not taken for a draft', () => {
+    expect(promptOf(fx('idle-cursor.ansi'), { x: 2, y: 36 })).toEqual({ draft: '' })
+  })
+  test('2.1.299: text typed locally, CJK counted as two columns', () => {
+    expect(promptOf(fx('draft-cursor.ansi'), { x: 21, y: 36 })).toEqual({ draft: '写了一半 half typed' })
+    expect(promptOf(fx('draft-cursor.ansi'), { x: 6, y: 36 })).toEqual({ draft: '写了' })
+  })
+  test('2.1.299: multi-line draft', () => {
+    expect(promptOf(fx('multiline-cursor.ansi'), { x: 23, y: 36 })).toEqual({ draft: '第一行\n2. second line 第二行' })
+  })
+  test('2.1.299: no input line without the cursor in the box', () => {
+    expect(promptOf(fx('idle-cursor.ansi'))).toBeUndefined()
+    expect(promptOf(fx('idle-cursor.ansi'), { x: 0, y: 39 })).toBeUndefined()
   })
   test('a multi-line prompt put back after an interruption', () => {
     expect(promptOf(fx('restored.ansi'))).toEqual({

@@ -24,12 +24,32 @@ export async function leaveCopyMode(p: Pane): Promise<void> {
   if (stdout.trim() === '1') await tmux(p, ['send-keys', '-t', p.pane, '-X', 'cancel'])
 }
 
+export type Cursor = { x: number; y: number }
+
+/**
+ * The screen with colours and the terminal's cursor (undefined while hidden),
+ * read by one tmux command so the two match.
+ */
+export async function captureWithCursor(p: Pane): Promise<{ screen: string; cursor?: Cursor }> {
+  const { stdout } = await tmux(p, ['display-message', '-p', '-t', p.pane, '#{cursor_flag} #{cursor_x} #{cursor_y}', ';', 'capture-pane', '-p', '-e', '-t', p.pane])
+  const nl = stdout.indexOf('\n')
+  const [flag, x, y] = stdout.slice(0, nl).split(' ').map(Number)
+  return { screen: stdout.slice(nl + 1), cursor: flag ? { x, y } : undefined }
+}
+
+/** The input box showing in the pane right now; see promptOf. */
+export async function promptIn(p: Pane): Promise<{ draft: string } | undefined> {
+  const { screen, cursor } = await captureWithCursor(p)
+  return promptOf(screen, cursor)
+}
+
 /**
  * Claude Code's input box: a rule, "❯" and a no-break space, what has been typed
- * (continuation lines indented by two), the cursor it draws in inverse video,
- * then another rule. Earlier prompts in the scrollback have the "❯" but neither
- * the rule above nor a cursor; dialogs mark their selected option with an
- * indented "❯".
+ * (continuation lines indented by two), the cursor, then another rule. Up to
+ * 2.1.273 Claude Code drew the cursor itself in inverse video; later versions
+ * use the terminal's cursor instead, and show a dimmed hint ("Try …") in an
+ * empty box. Earlier prompts in the scrollback have the "❯" but neither the rule
+ * above nor a cursor; dialogs mark their selected option with an indented "❯".
  */
 /** The rules above and below it; either can carry a label, so only the start is checked. */
 const BOX_EDGE_RE = /^─/
@@ -38,10 +58,11 @@ const CURSOR = '\x1b[7m'
 
 /**
  * The input box on a screen captured with colours: `draft` is the text before
- * the cursor, every line of it. Undefined when no input box is showing: a
- * dialog, a picker such as /model's, or `!` shell mode.
+ * the cursor, every line of it. `cursor` is the terminal's cursor, for versions
+ * that don't draw their own. Undefined when no input box is showing: a dialog,
+ * a picker such as /model's, or `!` shell mode.
  */
-export function promptOf(screenWithColors: string): { draft: string } | undefined {
+export function promptOf(screenWithColors: string, cursor?: Cursor): { draft: string } | undefined {
   const lines = screenWithColors.split('\n')
   const plain = lines.map(stripAnsi)
   let start = -1
@@ -50,12 +71,25 @@ export function promptOf(screenWithColors: string): { draft: string } | undefine
   let end = start + 1
   while (end < lines.length && !BOX_EDGE_RE.test(plain[end])) end++
   const box = lines.slice(start, end).join('\n')
-  const cursor = box.indexOf(CURSOR)
-  if (cursor < 0) return undefined
-  const draft = stripAnsi(box.slice(0, cursor))
-    .replace(PROMPT_START_RE, '')
-    .replace(/\n {2}/g, '\n')
+  const drawn = box.indexOf(CURSOR)
+  let before: string
+  if (drawn >= 0) before = stripAnsi(box.slice(0, drawn))
+  else if (cursor && cursor.y >= start && cursor.y < end) before = [...plain.slice(start, cursor.y), upToColumn(plain[cursor.y], cursor.x)].join('\n')
+  else return undefined
+  const draft = before.replace(PROMPT_START_RE, '').replace(/\n {2}/g, '\n')
   return { draft: draft.trim() }
+}
+
+/** The start of `line` that fills its first `x` columns (CJK characters take two). */
+function upToColumn(line: string, x: number): string {
+  let width = 0
+  let i = 0
+  for (const ch of line) {
+    if (width >= x) break
+    width += Bun.stringWidth(ch)
+    i += ch.length
+  }
+  return line.slice(0, i)
 }
 
 let pastes = 0

@@ -57,7 +57,7 @@ import { daemonRunning } from './autostart'
 import { keysToTmux, type Key } from './keys'
 import { cardEmbed, toolPreview, type Card, type CardState } from './cards'
 import { discordify } from './markdown'
-import { capture, dialogOptions, leaveCopyMode, parseKeys, pasteAndSubmit, promptOf, screenTail, tmux, type DialogOption, type Pane } from './terminal'
+import { capture, dialogOptions, leaveCopyMode, parseKeys, pasteAndSubmit, promptIn, screenTail, tmux, type DialogOption, type Pane } from './terminal'
 
 const cfg = loadConfig()
 /** Experimental: several computers share this bot and guild; this one's name. */
@@ -1000,10 +1000,10 @@ function typeMessage(t: Tracked, text: string): Promise<{ error?: string }> {
     if (t.live?.status === 'waiting') return { error: m.sessionWaiting }
     await leaveCopyMode(pane)
     // Right after a dialog closes, the input line takes a moment to come back.
-    let prompt = promptOf(await capture(pane, true))
+    let prompt = await promptIn(pane)
     for (let i = 0; !prompt && i < 6; i++) {
       await Bun.sleep(500)
-      prompt = promptOf(await capture(pane, true))
+      prompt = await promptIn(pane)
     }
     if (!prompt) return { error: m.noPromptLine }
     // Interrupted before it answered, Claude Code puts the prompt back in the box. That
@@ -1012,7 +1012,7 @@ function typeMessage(t: Tracked, text: string): Promise<{ error?: string }> {
       // Ctrl+C clears the whole box, every line of it, when there is something in it.
       await tmux(pane, ['send-keys', '-t', pane.pane, 'C-c'])
       await Bun.sleep(300)
-      prompt = promptOf(await capture(pane, true))
+      prompt = await promptIn(pane)
       if (!prompt) return { error: m.noPromptLine }
     }
     if (prompt.draft) return { error: m.draftInTerminal(clip(prompt.draft, 80)) }
@@ -2041,7 +2041,7 @@ async function stopSession(t: Tracked, r: Replier, peer: Socket | undefined) {
     await reply.edit(m.stillBusy)
   } else {
     const pane = tmuxPaneOf(pid)
-    const draft = pane ? promptOf(await capture(pane, true).catch(() => ''))?.draft : undefined
+    const draft = pane ? (await promptIn(pane).catch(() => undefined))?.draft : undefined
     await reply.edit(draft && isPutBack(t, draft) ? m.interruptedPutBack : m.interrupted)
   }
 }
