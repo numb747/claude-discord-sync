@@ -50,6 +50,7 @@ export async function promptIn(p: Pane): Promise<{ draft: string } | undefined> 
  * use the terminal's cursor instead, and show a dimmed hint ("Try …") in an
  * empty box. Earlier prompts in the scrollback have the "❯" but neither the rule
  * above nor a cursor; dialogs mark their selected option with an indented "❯".
+ * What has been typed is never dimmed; hints and suggestions always are.
  */
 /** The rules above and below it; either can carry a label, so only the start is checked. */
 const BOX_EDGE_RE = /^─/
@@ -57,10 +58,10 @@ const PROMPT_START_RE = /^❯[\u00a0 ]/
 const CURSOR = '\x1b[7m'
 
 /**
- * The input box on a screen captured with colours: `draft` is the text before
- * the cursor, every line of it. `cursor` is the terminal's cursor, for versions
- * that don't draw their own. Undefined when no input box is showing: a dialog,
- * a picker such as /model's, or `!` shell mode.
+ * The input box on a screen captured with colours: `draft` is everything typed
+ * in it, every line, wherever the cursor is in it. `cursor` is the terminal's
+ * cursor, for versions that don't draw their own. Undefined when no input box
+ * is showing: a dialog, a picker such as /model's, or `!` shell mode.
  */
 export function promptOf(screenWithColors: string, cursor?: Cursor): { draft: string } | undefined {
   const lines = screenWithColors.split('\n')
@@ -71,25 +72,38 @@ export function promptOf(screenWithColors: string, cursor?: Cursor): { draft: st
   let end = start + 1
   while (end < lines.length && !BOX_EDGE_RE.test(plain[end])) end++
   const box = lines.slice(start, end).join('\n')
-  const drawn = box.indexOf(CURSOR)
-  let before: string
-  if (drawn >= 0) before = stripAnsi(box.slice(0, drawn))
-  else if (cursor && cursor.y >= start && cursor.y < end) before = [...plain.slice(start, cursor.y), upToColumn(plain[cursor.y], cursor.x)].join('\n')
-  else return undefined
-  const draft = before.replace(PROMPT_START_RE, '').replace(/\n {2}/g, '\n')
+  // A box without the cursor in it isn't taking input.
+  if (!box.includes(CURSOR) && !(cursor && cursor.y >= start && cursor.y < end)) return undefined
+  // The cursor can be anywhere in what was typed (Home, ←), so all of the box counts.
+  const draft = undimmed(box).replace(PROMPT_START_RE, '').replace(/\n {2}/g, '\n')
   return { draft: draft.trim() }
 }
 
-/** The start of `line` that fills its first `x` columns (CJK characters take two). */
-function upToColumn(line: string, x: number): string {
-  let width = 0
-  let i = 0
-  for (const ch of line) {
-    if (width >= x) break
-    width += Bun.stringWidth(ch)
-    i += ch.length
+const ANSI_SPLIT_RE = new RegExp(`(${ANSI_RE.source})`)
+
+/** Text captured with colours, without the colours and without what was shown dimmed. */
+function undimmed(text: string): string {
+  let dim = false
+  let out = ''
+  for (const part of text.split(ANSI_SPLIT_RE)) {
+    if (part.startsWith('\x1b[')) {
+      if (part.endsWith('m')) dim = dimAfter(part, dim)
+    } else out += dim ? part.replace(/[^\n]/g, '') : part
   }
-  return line.slice(0, i)
+  return out
+}
+
+/** Whether text is dimmed after the SGR sequence `sgr`, given whether it was before. */
+function dimAfter(sgr: string, dim: boolean): boolean {
+  const ps = sgr.slice(2, -1).split(';')
+  for (let i = 0; i < ps.length; i++) {
+    const p = ps[i]
+    if (p === '' || p === '0' || p === '22') dim = false
+    else if (p === '2') dim = true
+    // 38;5;n and 38;2;r;g;b: colour arguments, not attributes.
+    else if (p === '38' || p === '48' || p === '58') i += ps[i + 1] === '5' ? 2 : 4
+  }
+  return dim
 }
 
 let pastes = 0

@@ -25,10 +25,22 @@ describe('promptOf', () => {
   })
   test('2.1.299: text typed locally, CJK counted as two columns', () => {
     expect(promptOf(fx('draft-cursor.ansi'), { x: 21, y: 36 })).toEqual({ draft: '写了一半 half typed' })
-    expect(promptOf(fx('draft-cursor.ansi'), { x: 6, y: 36 })).toEqual({ draft: '写了' })
+  })
+  test('2.1.299: text after the cursor is part of the draft (cursor moved back with ← or Home)', () => {
+    expect(promptOf(fx('draft-cursor.ansi'), { x: 6, y: 36 })).toEqual({ draft: '写了一半 half typed' })
+    expect(promptOf(fx('draft-cursor.ansi'), { x: 2, y: 36 })).toEqual({ draft: '写了一半 half typed' })
   })
   test('2.1.299: multi-line draft', () => {
     expect(promptOf(fx('multiline-cursor.ansi'), { x: 23, y: 36 })).toEqual({ draft: '第一行\n2. second line 第二行' })
+    expect(promptOf(fx('multiline-cursor.ansi'), { x: 2, y: 35 })).toEqual({ draft: '第一行\n2. second line 第二行' })
+  })
+  test('2.1.299: dimmed text after the draft (a suggestion) is not part of it; coloured text is', () => {
+    const screen = fx('draft-cursor.ansi').replace(' half typed', ' half \x1b[38;5;2mtyped\x1b[39m\x1b[2m suggested\x1b[0m')
+    expect(promptOf(screen, { x: 21, y: 36 })).toEqual({ draft: '写了一半 half typed' })
+  })
+  test('cursor drawn in the middle of the draft', () => {
+    const screen = fx('draft.ansi').replace('half typed\x1b[7m \x1b[0m', 'half\x1b[7m \x1b[0mtyped')
+    expect(promptOf(screen)).toEqual({ draft: 'half typed' })
   })
   test('2.1.299: no input line without the cursor in the box', () => {
     expect(promptOf(fx('idle-cursor.ansi'))).toBeUndefined()
