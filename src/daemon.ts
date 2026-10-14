@@ -1768,6 +1768,8 @@ const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
 const STARTUP_PROMPTS: { re: RegExp; accept?: RegExp }[] = [
   { re: /development channel/i },
   { re: /Is this a project you created or one you trust/i, accept: /Yes, I trust this folder/i },
+  // bin/ccd starts in bypass mode; on a machine that hasn't accepted it yet the warning defaults to "No, exit".
+  { re: /Bypass Permissions mode/i, accept: /Yes, I accept/i },
 ]
 
 /** Keys to press for a startup dialog: Enter if the cursor is on the accepting option, else Down. */

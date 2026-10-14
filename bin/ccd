@@ -3,7 +3,7 @@
 # config.json) loaded, so the session can be driven from Discord. All arguments
 # are passed through to `claude`. The config (MCP server, hooks) comes from
 # src/ccd.ts; exec keeps Claude Code on this shell's PID, which /new relies on to
-# find tmux sessions.
+# find tmux sessions. Sessions start in bypass permissions mode (local change).
 # Resolve symlinks portably (macOS before 12.3 has no `readlink -f`).
 SRC="$0"
 while [ -L "$SRC" ]; do
@@ -15,4 +15,4 @@ OUT="$(bun "$DIR/src/ccd.ts" --write-config)" || exit 1
 CFG="${OUT%%$'\n'*}"
 CHANNEL=()
 case "$OUT" in *$'\n'channels) CHANNEL=(--dangerously-load-development-channels server:discord-sync) ;; esac
-exec claude --mcp-config "$CFG/mcp.json" --settings "$CFG/settings.json" "${CHANNEL[@]}" "$@"
+exec claude --dangerously-skip-permissions --mcp-config "$CFG/mcp.json" --settings "$CFG/settings.json" "${CHANNEL[@]}" "$@"
