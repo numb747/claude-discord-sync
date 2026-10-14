@@ -109,3 +109,27 @@ describe('renderRecord', () => {
     expect(blocks).toEqual([{ kind: 'info', text: '-# ⏹️ Interrupted' }])
   })
 })
+
+describe('lastSentPrompt', () => {
+  test('the last prompt, skipping tool results, meta records and replies after it', () => {
+    const { lastSentPrompt } = require('../src/sessions')
+    const { mkdtempSync, writeFileSync } = require('fs')
+    const { join } = require('path')
+    const file = join(mkdtempSync('/tmp/cds-test-'), 't.jsonl')
+    const rec = (o: object) => JSON.stringify(o)
+    writeFileSync(
+      file,
+      [
+        rec({ type: 'user', message: { role: 'user', content: 'first' } }),
+        rec({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } }),
+        rec({ type: 'user', message: { role: 'user', content: 'second\nline two\n' } }),
+        rec({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'x', content: 'out' }] } }),
+        rec({ type: 'user', isMeta: true, message: { role: 'user', content: 'meta' } }),
+        rec({ type: 'last-prompt', lastPrompt: 'second' }),
+        '',
+      ].join('\n'),
+    )
+    expect(lastSentPrompt(file).trim()).toBe('second\nline two')
+    expect(lastSentPrompt(join(file, 'missing'))).toBeUndefined()
+  })
+})

@@ -19,6 +19,12 @@ describe('promptOf', () => {
   test('no input line while a dialog is open', () => {
     expect(promptOf(fx('perm.ansi'))).toBeUndefined()
   })
+  test('a multi-line prompt put back after an interruption', () => {
+    expect(promptOf(fx('restored.ansi'))).toEqual({
+      draft:
+        '请帮我写一个很长的故事，主题是星际旅行，要求：\n1. 至少五千字\n2. 有三个主要角色，每个角色都要有完整的背景故事和性格描写，并且角色之间要有冲突和和解的过程，结尾要出人意料但是合理',
+    })
+  })
 })
 
 describe('dialogOptions', () => {

@@ -45,7 +45,7 @@ import { homedir, hostname } from 'os'
 import { readFileSync, writeFileSync, appendFileSync, renameSync, rmSync, mkdirSync, chmodSync, statSync, readdirSync, openSync, readSync, closeSync } from 'fs'
 import { basename, dirname, join, resolve } from 'path'
 import { loadConfig, readConfigFile, STATE_DIR, SOCKET_PATH, HOST_ID, CLAIM_RE, otherClaim } from './config'
-import { scanSessions, findTranscript, isAlive, JsonlTail, type LiveSession } from './sessions'
+import { scanSessions, findTranscript, isAlive, JsonlTail, lastSentPrompt, type LiveSession } from './sessions'
 import { renderRecord, titleOf, toolLabel, pack, chunk, type Block, type RenderContext, type Post } from './render'
 import { send as ipcSend, onLines, type ClientMsg, type AskQuestion, type PermDecision } from './ipc'
 import { m, SLASH_DESCRIPTIONS } from './i18n'
@@ -976,6 +976,13 @@ function wasTyped(t: Tracked, plain: string): boolean {
   return true
 }
 
+/** Whether what's in the input box is the session's last prompt, put back by an interruption. */
+function isPutBack(t: Tracked, draft: string): boolean {
+  const squash = (s: string) => s.replace(/\s+/g, '')
+  const last = lastSentPrompt(t.st.transcript)
+  return !!last && squash(last) === squash(draft)
+}
+
 /** One paste at a time per pane, so two quick messages can't interleave. */
 const typing = new Map<string, Promise<unknown>>()
 
@@ -999,6 +1006,15 @@ function typeMessage(t: Tracked, text: string): Promise<{ error?: string }> {
       prompt = promptOf(await capture(pane, true))
     }
     if (!prompt) return { error: m.noPromptLine }
+    // Interrupted before it answered, Claude Code puts the prompt back in the box. That
+    // was already sent, so a new message replaces it; anything else typed there is someone's draft.
+    if (prompt.draft && t.live?.status === 'idle' && isPutBack(t, prompt.draft)) {
+      // Ctrl+C clears the whole box, every line of it, when there is something in it.
+      await tmux(pane, ['send-keys', '-t', pane.pane, 'C-c'])
+      await Bun.sleep(300)
+      prompt = promptOf(await capture(pane, true))
+      if (!prompt) return { error: m.noPromptLine }
+    }
     if (prompt.draft) return { error: m.draftInTerminal(clip(prompt.draft, 80)) }
     const entry = { text: sameText(text), at: Date.now() }
     ;(t.typed ??= []).push(entry)
@@ -2024,7 +2040,9 @@ async function stopSession(t: Tracked, r: Replier, peer: Socket | undefined) {
     setStopFlag(t)
     await reply.edit(m.stillBusy)
   } else {
-    await reply.edit(m.interrupted)
+    const pane = tmuxPaneOf(pid)
+    const draft = pane ? promptOf(await capture(pane, true).catch(() => ''))?.draft : undefined
+    await reply.edit(draft && isPutBack(t, draft) ? m.interruptedPutBack : m.interrupted)
   }
 }
 

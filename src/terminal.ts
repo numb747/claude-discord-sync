@@ -25,24 +25,37 @@ export async function leaveCopyMode(p: Pane): Promise<void> {
 }
 
 /**
- * Claude Code's input line: "❯", a no-break space, what has been typed, then
- * the cursor it draws in inverse video. Lines of earlier prompts in the
- * scrollback have the "❯" but no cursor.
+ * Claude Code's input box: a rule, "❯" and a no-break space, what has been typed
+ * (continuation lines indented by two), the cursor it draws in inverse video,
+ * then another rule. Earlier prompts in the scrollback have the "❯" but neither
+ * the rule above nor a cursor; dialogs mark their selected option with an
+ * indented "❯".
  */
-const PROMPT_RE = /❯[\u00a0 ](.*?)\x1b\[7m/
+/** The rules above and below it; either can carry a label, so only the start is checked. */
+const BOX_EDGE_RE = /^─/
+const PROMPT_START_RE = /^❯[\u00a0 ]/
+const CURSOR = '\x1b[7m'
 
 /**
- * The input line on a screen captured with colours: `draft` is the text before
- * the cursor. Undefined when no input line is showing: a dialog, a picker such
- * as /model's, or `!` shell mode.
+ * The input box on a screen captured with colours: `draft` is the text before
+ * the cursor, every line of it. Undefined when no input box is showing: a
+ * dialog, a picker such as /model's, or `!` shell mode.
  */
 export function promptOf(screenWithColors: string): { draft: string } | undefined {
-  const line = screenWithColors
-    .split('\n')
-    .reverse()
-    .find(l => PROMPT_RE.test(l))
-  if (!line) return undefined
-  return { draft: stripAnsi(PROMPT_RE.exec(line)![1]).trim() }
+  const lines = screenWithColors.split('\n')
+  const plain = lines.map(stripAnsi)
+  let start = -1
+  for (let i = plain.length - 1; i > 0 && start < 0; i--) if (PROMPT_START_RE.test(plain[i]) && BOX_EDGE_RE.test(plain[i - 1])) start = i
+  if (start < 0) return undefined
+  let end = start + 1
+  while (end < lines.length && !BOX_EDGE_RE.test(plain[end])) end++
+  const box = lines.slice(start, end).join('\n')
+  const cursor = box.indexOf(CURSOR)
+  if (cursor < 0) return undefined
+  const draft = stripAnsi(box.slice(0, cursor))
+    .replace(PROMPT_START_RE, '')
+    .replace(/\n {2}/g, '\n')
+  return { draft: draft.trim() }
 }
 
 let pastes = 0

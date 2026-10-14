@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, existsSync, openSync, readSync, closeSync, s
 import { join } from 'path'
 import { SESSIONS_DIR, PROJECTS_DIR } from './config'
 import { parentPid, procStart } from './platform'
+import { renderRecord, type RenderContext } from './render'
 
 /** One entry of Claude Code's live-session registry (~/.claude/sessions/<pid>.json). */
 export type LiveSession = {
@@ -111,4 +112,36 @@ export class JsonlTail {
     }
     return out
   }
+}
+
+/**
+ * The last prompt sent in a transcript: what Claude Code puts back in the input
+ * box when it's interrupted before it answers.
+ */
+export function lastSentPrompt(file: string | undefined): string | undefined {
+  if (!file) return undefined
+  try {
+    const fd = openSync(file, 'r')
+    try {
+      const size = statSync(file).size
+      const buf = Buffer.alloc(Math.min(size, 1024 * 1024))
+      readSync(fd, buf, 0, buf.length, size - buf.length)
+      const lines = buf.toString('utf8').split('\n')
+      const ctx: RenderContext = { toolNames: new Map(), showToolCalls: false }
+      for (let i = lines.length - 1; i > 0; i--) {
+        if (!lines[i].includes('"type":"user"')) continue
+        let o: any
+        try {
+          o = JSON.parse(lines[i])
+        } catch {
+          continue
+        }
+        const plain = renderRecord(o, ctx).find(b => b.plain)?.plain
+        if (plain) return plain
+      }
+    } finally {
+      closeSync(fd)
+    }
+  } catch {}
+  return undefined
 }

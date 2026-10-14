@@ -201,7 +201,8 @@ The daemon refuses to send a message, and says why, rather than type it somewher
 | Situation | Result |
 |---|---|
 | A dialog is open in the terminal | Refused: answer the dialog first |
-| Someone has typed into the input line locally and not sent it | Refused; the reply quotes the draft |
+| Someone has typed into the input line locally and not sent it (multi-line too) | Refused; the reply quotes the draft |
+| The input line holds the last prompt, put back by an interruption (Claude Code does this when interrupted before it answers) | Cleared, then the new message is sent: it was already sent once, so it is not a draft |
 | No input line on screen (a menu is open, or `!` shell mode) | Refused: check with `/screen`, close it with `/key esc` |
 | The message starts with `!` but isn't a bot command | Refused, because Claude Code would run it as a shell command |
 | The message starts with `/` | Typed in as is, so `/compact`, `/cost` and the like work remotely |
