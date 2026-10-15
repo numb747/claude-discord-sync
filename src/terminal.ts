@@ -24,6 +24,16 @@ export async function leaveCopyMode(p: Pane): Promise<void> {
   if (stdout.trim() === '1') await tmux(p, ['send-keys', '-t', p.pane, '-X', 'cancel'])
 }
 
+/**
+ * Tell the pane it has focus, as a terminal does with focus reporting on. Claude
+ * Code stops showing its cursor when tmux reports the focus gone (someone was
+ * attached to the session and left, or a split moved it), and never gets it back
+ * while nobody is attached.
+ */
+export async function focusIn(p: Pane): Promise<void> {
+  await tmux(p, ['send-keys', '-t', p.pane, '-H', '1b', '5b', '49'])
+}
+
 export type Cursor = { x: number; y: number }
 
 /**
@@ -104,6 +114,72 @@ function dimAfter(sgr: string, dim: boolean): boolean {
     else if (p === '38' || p === '48' || p === '58') i += ps[i + 1] === '5' ? 2 : 4
   }
   return dim
+}
+
+/**
+ * The agent list under the input box while background agents or teammates run:
+ * the main session first, then one row per agent. "●" marks the one on view,
+ * "❯" the selection while the list has the keyboard (↓ from the box). With
+ * another agent on view the box reads "Message @…" and talks to that agent.
+ */
+export type AgentList = { names: string[]; viewing: number; selected?: number }
+
+const AGENT_ROW_RE = /^(❯| ) ([●◯]) (\S+)/
+/** ← on an empty box with agents running asks this; Enter would background the session. */
+const BACKGROUND_DIALOG_RE = /^\s*Background this session\?\s*$/
+
+/** The last non-blank lines of a screen, without colours. */
+function tailLines(screen: string, n: number): string[] {
+  const lines = stripAnsi(screen).split('\n')
+  let end = lines.length
+  while (end > 0 && !lines[end - 1].trim()) end--
+  return lines.slice(Math.max(0, end - n), end)
+}
+
+export function agentList(screen: string): AgentList | undefined {
+  const lines = tailLines(screen, 60)
+  let i = lines.length
+  while (i > 0 && AGENT_ROW_RE.test(lines[i - 1])) i--
+  const rows = lines.slice(i).map(l => AGENT_ROW_RE.exec(l)!)
+  const viewing = rows.findIndex(r => r[2] === '●')
+  if (!rows.length || viewing < 0) return undefined
+  const selected = rows.findIndex(r => r[1] === '❯')
+  return { names: rows.map(r => r[3]), viewing, ...(selected >= 0 ? { selected } : {}) }
+}
+
+/**
+ * The key that takes the screen a step back to the main session's own input
+ * box, or undefined when it's there (or the screen isn't one of these). Only
+ * moves the list's selection, views the main session (Enter on the first row),
+ * or cancels the background dialog: never Enter on an agent, never x (stop).
+ */
+export function keyBackToLeader(screen: string): 'Up' | 'Down' | 'Enter' | 'Escape' | undefined {
+  const tail = tailLines(screen, 8)
+  if (tail.some(l => BACKGROUND_DIALOG_RE.test(l)) && /Esc to cancel/.test(tail.at(-1) ?? '')) return 'Escape'
+  const list = agentList(screen)
+  if (!list) return undefined
+  if (list.selected === undefined) return list.viewing === 0 ? undefined : 'Down'
+  if (list.selected > 0) return 'Up'
+  return list.viewing === 0 ? 'Up' : 'Enter'
+}
+
+/**
+ * Take the pane back to the main session's input box, where someone looking at
+ * an agent left it; false if it didn't get there. After each key, waits for the
+ * list to change so a slow redraw doesn't get the key pressed twice (↑ once too
+ * often would bring back an old prompt).
+ */
+export async function backToLeader(p: Pane): Promise<boolean> {
+  const where = (s: string) => JSON.stringify([keyBackToLeader(s) === 'Escape', agentList(s)])
+  for (let i = 0; i < 8; i++) {
+    const screen = await capture(p)
+    const key = keyBackToLeader(screen)
+    if (!key) return true
+    await tmux(p, ['send-keys', '-t', p.pane, key])
+    const before = where(screen)
+    for (let t = 0; t < 10 && where(await capture(p)) === before; t++) await Bun.sleep(150)
+  }
+  return false
 }
 
 let pastes = 0

@@ -57,7 +57,7 @@ import { daemonRunning } from './autostart'
 import { keysToTmux, type Key } from './keys'
 import { cardEmbed, toolPreview, type Card, type CardState } from './cards'
 import { discordify } from './markdown'
-import { capture, dialogOptions, leaveCopyMode, parseKeys, pasteAndSubmit, promptIn, screenTail, tmux, type DialogOption, type Pane } from './terminal'
+import { backToLeader, capture, dialogOptions, focusIn, leaveCopyMode, parseKeys, pasteAndSubmit, promptIn, screenTail, tmux, type DialogOption, type Pane } from './terminal'
 
 const cfg = loadConfig()
 /** Experimental: several computers share this bot and guild; this one's name. */
@@ -999,9 +999,13 @@ function typeMessage(t: Tracked, text: string): Promise<{ error?: string }> {
   const next = (typing.get(key) ?? Promise.resolve()).then(async (): Promise<{ error?: string }> => {
     if (t.live?.status === 'waiting') return { error: m.sessionWaiting }
     await leaveCopyMode(pane)
+    // On another agent's view the box would send the message to that agent.
+    if (!(await backToLeader(pane))) return { error: m.notOnLeader }
     // Right after a dialog closes, the input line takes a moment to come back.
     let prompt = await promptIn(pane)
     for (let i = 0; !prompt && i < 6; i++) {
+      // Or Claude Code thinks it lost focus, so it shows no cursor and the box seems not to take input.
+      if (i === 0) await focusIn(pane)
       await Bun.sleep(500)
       prompt = await promptIn(pane)
     }

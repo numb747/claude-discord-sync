@@ -6,7 +6,7 @@
 import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'fs'
 import { join } from 'path'
-import { dialogOptions, parseKeys, promptOf, screenTail } from '../src/terminal'
+import { agentList, dialogOptions, keyBackToLeader, parseKeys, promptOf, screenTail } from '../src/terminal'
 
 const fx = (name: string) => readFileSync(join(import.meta.dir, 'fixtures', name), 'utf8')
 
@@ -51,6 +51,40 @@ describe('promptOf', () => {
       draft:
         '请帮我写一个很长的故事，主题是星际旅行，要求：\n1. 至少五千字\n2. 有三个主要角色，每个角色都要有完整的背景故事和性格描写，并且角色之间要有冲突和和解的过程，结尾要出人意料但是合理',
     })
+  })
+})
+
+// agents-*.ansi: 2.1.273 with a background agent running, after the keys named in each test.
+describe('agentList / keyBackToLeader', () => {
+  test('main session on view, box has the keyboard: nothing to do', () => {
+    expect(agentList(fx('agents-idle.ansi'))).toEqual({ names: ['main', 'general-purpose'], viewing: 0 })
+    expect(keyBackToLeader(fx('agents-idle.ansi'))).toBeUndefined()
+  })
+  test('no agents, or a dialog: nothing to do', () => {
+    for (const f of ['idle.ansi', 'draft.ansi', 'perm.ansi', 'idle-cursor.ansi']) {
+      expect(agentList(fx(f))).toBeUndefined()
+      expect(keyBackToLeader(fx(f))).toBeUndefined()
+    }
+  })
+  test('↓: the list has the keyboard, on the main session', () => {
+    expect(agentList(fx('agents-list-focused.ansi'))).toEqual({ names: ['main', 'general-purpose'], viewing: 0, selected: 0 })
+    expect(keyBackToLeader(fx('agents-list-focused.ansi'))).toBe('Up')
+  })
+  test('↓ ↓ Enter: viewing the agent, list still has the keyboard', () => {
+    expect(agentList(fx('agents-viewing-agent.ansi'))).toEqual({ names: ['main', 'general-purpose'], viewing: 1, selected: 1 })
+    expect(keyBackToLeader(fx('agents-viewing-agent.ansi'))).toBe('Up')
+  })
+  test('↓ ↓ Enter ↑ ↑: viewing the agent with the box ("Message @…") taking input', () => {
+    expect(agentList(fx('agents-viewing-agent-box.ansi'))).toEqual({ names: ['main', 'general-purpose'], viewing: 1 })
+    expect(keyBackToLeader(fx('agents-viewing-agent-box.ansi'))).toBe('Down')
+  })
+  test('then ↓ selects the main session, Enter views it, ↑ gives the box the keyboard', () => {
+    const selectedMain = fx('agents-viewing-agent-box.ansi').replace('  ◯ main', '❯ ◯ main')
+    expect(keyBackToLeader(selectedMain)).toBe('Enter')
+    expect(keyBackToLeader(fx('agents-back-on-main.ansi'))).toBe('Up')
+  })
+  test('← on an empty box: the background dialog is cancelled', () => {
+    expect(keyBackToLeader(fx('agents-background-dialog.ansi'))).toBe('Escape')
   })
 })
 
