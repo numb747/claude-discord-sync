@@ -89,6 +89,22 @@ export function promptOf(screenWithColors: string, cursor?: Cursor): { draft: st
   return { draft: draft.trim() }
 }
 
+/** The live input box's "❯ …" line (the one drawn under a rule), or undefined when no box is drawn. */
+function boxLine(screen: string): string | undefined {
+  const plain = stripAnsi(screen).split('\n')
+  for (let i = plain.length - 1; i > 0; i--) if (PROMPT_START_RE.test(plain[i]) && BOX_EDGE_RE.test(plain[i - 1])) return plain[i]
+  return undefined
+}
+
+/**
+ * A live input box is drawn (its top rule and "❯"), whether or not it holds the
+ * cursor. Lost focus draws the box but hides the cursor, so promptIn reads it as
+ * no input line though it is one; a dialog or menu draws no box at all.
+ */
+export function hasPromptBox(screen: string): boolean {
+  return boxLine(screen) !== undefined
+}
+
 const ANSI_SPLIT_RE = new RegExp(`(${ANSI_RE.source})`)
 
 /** Text captured with colours, without the colours and without what was shown dimmed. */
@@ -125,8 +141,21 @@ function dimAfter(sgr: string, dim: boolean): boolean {
 export type AgentList = { names: string[]; viewing: number; selected?: number }
 
 const AGENT_ROW_RE = /^(❯| ) ([●◯]) (\S+)/
+/** The box's placeholder while an agent is on view: a message typed now goes to that agent. */
+const AGENT_BOX_RE = /^❯[  ]+Message @\S/
 /** ← on an empty box with agents running asks this; Enter would background the session. */
 const BACKGROUND_DIALOG_RE = /^\s*Background this session\?\s*$/
+
+/**
+ * The input box is addressed to a sub-agent ("Message @name…"), so a message
+ * typed now would reach that agent instead of the main session. Read straight
+ * from the box line, so it still holds when the agent list below is too long or
+ * too far up the screen for agentList to parse.
+ */
+export function onAgentView(screen: string): boolean {
+  const l = boxLine(screen)
+  return l !== undefined && AGENT_BOX_RE.test(l)
+}
 
 /** The last non-blank lines of a screen, without colours. */
 function tailLines(screen: string, n: number): string[] {
@@ -174,7 +203,11 @@ export async function backToLeader(p: Pane): Promise<boolean> {
   for (let i = 0; i < 8; i++) {
     const screen = await capture(p)
     const key = keyBackToLeader(screen)
-    if (!key) return true
+    // No step left to take: we're at the main box — unless the box is still
+    // addressed to an agent ("Message @…"), which keyBackToLeader misses when the
+    // list is too long or too far up to parse. Typing there would reach the agent,
+    // so report that instead of guessing we're home.
+    if (!key) return !onAgentView(screen)
     await tmux(p, ['send-keys', '-t', p.pane, key])
     const before = where(screen)
     for (let t = 0; t < 10 && where(await capture(p)) === before; t++) await Bun.sleep(150)

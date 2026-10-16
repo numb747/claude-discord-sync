@@ -57,7 +57,7 @@ import { daemonRunning } from './autostart'
 import { keysToTmux, type Key } from './keys'
 import { cardEmbed, toolPreview, type Card, type CardState } from './cards'
 import { discordify } from './markdown'
-import { backToLeader, capture, dialogOptions, focusIn, leaveCopyMode, parseKeys, pasteAndSubmit, promptIn, screenTail, tmux, type DialogOption, type Pane } from './terminal'
+import { backToLeader, capture, dialogOptions, focusIn, hasPromptBox, leaveCopyMode, parseKeys, pasteAndSubmit, promptIn, screenTail, tmux, type DialogOption, type Pane } from './terminal'
 
 const cfg = loadConfig()
 /** Experimental: several computers share this bot and guild; this one's name. */
@@ -1004,8 +1004,10 @@ function typeMessage(t: Tracked, text: string): Promise<{ error?: string }> {
     // Right after a dialog closes, the input line takes a moment to come back.
     let prompt = await promptIn(pane)
     for (let i = 0; !prompt && i < 6; i++) {
-      // Or Claude Code thinks it lost focus, so it shows no cursor and the box seems not to take input.
-      if (i === 0) await focusIn(pane)
+      // Lost focus draws the box but hides the cursor, so it reads as no input line; nudge
+      // focus back. A dialog or menu draws no box at all — don't nudge it, the focus event
+      // (a bare Esc to a program not reporting focus) could dismiss what's open.
+      if (i === 0 && hasPromptBox(await capture(pane))) await focusIn(pane)
       await Bun.sleep(500)
       prompt = await promptIn(pane)
     }

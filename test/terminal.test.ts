@@ -6,7 +6,7 @@
 import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'fs'
 import { join } from 'path'
-import { agentList, dialogOptions, keyBackToLeader, parseKeys, promptOf, screenTail } from '../src/terminal'
+import { agentList, dialogOptions, hasPromptBox, keyBackToLeader, onAgentView, parseKeys, promptOf, screenTail } from '../src/terminal'
 
 const fx = (name: string) => readFileSync(join(import.meta.dir, 'fixtures', name), 'utf8')
 
@@ -85,6 +85,40 @@ describe('agentList / keyBackToLeader', () => {
   })
   test('← on an empty box: the background dialog is cancelled', () => {
     expect(keyBackToLeader(fx('agents-background-dialog.ansi'))).toBe('Escape')
+  })
+})
+
+describe('onAgentView', () => {
+  test('true only while the box is addressed to an agent ("Message @…")', () => {
+    expect(onAgentView(fx('agents-viewing-agent.ansi'))).toBe(true)
+    expect(onAgentView(fx('agents-viewing-agent-box.ansi'))).toBe(true)
+  })
+  test('false on the main session, the list, a dialog, or a plain box', () => {
+    for (const f of ['agents-idle.ansi', 'agents-list-focused.ansi', 'agents-back-on-main.ansi', 'idle.ansi', 'draft.ansi', 'perm.ansi']) {
+      expect(onAgentView(fx(f))).toBe(false)
+    }
+  })
+  test('still detected when a trailing status line leaves agentList unable to parse', () => {
+    // A long list or a line below it can defeat agentList (and so keyBackToLeader);
+    // the box line still gives it away, so backToLeader reports it instead of typing there.
+    const screen = fx('agents-viewing-agent-box.ansi') + '\n  running 3 agents · ↓ to manage\n'
+    expect(agentList(screen)).toBeUndefined()
+    expect(keyBackToLeader(screen)).toBeUndefined()
+    expect(onAgentView(screen)).toBe(true)
+  })
+})
+
+describe('hasPromptBox', () => {
+  test('true when the box is drawn, even without the cursor (lost focus)', () => {
+    expect(hasPromptBox(fx('idle.ansi'))).toBe(true)
+    expect(hasPromptBox(fx('draft.ansi'))).toBe(true)
+    expect(hasPromptBox(fx('agents-viewing-agent-box.ansi'))).toBe(true)
+    // 2.1.299 hides the cursor on lost focus; promptOf reads no input line, the box is still there.
+    expect(promptOf(fx('idle-cursor.ansi'))).toBeUndefined()
+    expect(hasPromptBox(fx('idle-cursor.ansi'))).toBe(true)
+  })
+  test('false when a dialog or menu is open, so focus is not nudged at it', () => {
+    expect(hasPromptBox(fx('perm.ansi'))).toBe(false)
   })
 })
 
