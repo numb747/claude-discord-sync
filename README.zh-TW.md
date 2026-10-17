@@ -39,6 +39,7 @@ Discord 上的文字支援英文、繁體中文和簡體中文，用設定裡的
 - **封存：** session 結束後保留原本的頻道（包括會議討論串），移到封存分類（`Claude 已結束`，每個分類放滿 50 個後依序開 `…-2`、`…-3`）。`/resume` 會把頻道移回來。
 - **自動清理：** 只有在伺服器快到 Discord 500 個頻道的上限時，才會刪除最久以前結束的 session 頻道（控制台會說明刪了哪些）。對話紀錄和會議紀錄仍保留在你的電腦上。也可以另外設定保留天數。
 - **多台電腦共用一個 bot：** 每台電腦各用一個伺服器，見[多台電腦](#多台電腦共用一個-bot)。
+- **新版本通知：** 有新版本時控制台會提醒你（見 `updateCheck`），要不要更新由你決定。
 
 ## 需求
 
@@ -52,7 +53,8 @@ Discord 上的文字支援英文、繁體中文和簡體中文，用設定裡的
 | | Linux | macOS | Windows |
 |---|---|---|---|
 | 同步、對話、選擇題、計畫、權限、控制台、封存 | ✅ | ✅ | ✅ |
-| `/stop`、`/end` | tmux 或 `TIOCSTI` | tmux 或透過系統內建 Perl 的 `TIOCSTI` | 把按鍵送進 session 的主控台（**實驗性**） |
+| `/stop`、`/end`、`/model`、`/rename`（把按鍵送進 session） | tmux 或 `TIOCSTI` | tmux 或透過系統內建 Perl 的 `TIOCSTI` | 把按鍵送進 session 的主控台（**實驗性**） |
+| `/mode`（需要讀取 session 的畫面） | 只限 tmux | 只限 tmux | session 的主控台（**實驗性**） |
 | `/new`、`/resume` | tmux | tmux | 開一個新的主控台視窗（**實驗性**） |
 | 開機自動啟動 daemon（由 `setup` 設定） | systemd 使用者服務 | launchd agent | 啟動資料夾 |
 
@@ -74,11 +76,11 @@ curl -fsSL https://raw.githubusercontent.com/Cnyn0403/claude-discord-sync/master
 irm https://raw.githubusercontent.com/Cnyn0403/claude-discord-sync/master/install.ps1 | iex
 ```
 
-安裝程式會下載你的平台專用的單一執行檔（不需要 Bun 或 Node），用 release 的 SHA-256 驗證檔案，再啟動安裝精靈 `claude-discord-sync setup`：
+安裝程式會下載你的平台專用的單一執行檔（不需要 Bun 或 Node），用 release 的 SHA-256 驗證檔案，再啟動安裝精靈 `claude-discord-sync setup`，先選語言，然後：
 
 1. 帶你建立 bot，然後輸入 token（輸入時不會顯示），並向 Discord 驗證，包括有沒有開啟 **Message Content Intent**。
 2. 顯示邀請連結，等 bot 加入你的伺服器。
-3. 詢問你的 Discord user ID（只有你能操作 session）和介面語言。
+3. 詢問你的 Discord user ID（只有你能操作 session）。
 4. 安裝 `ccd` 指令。
 5. 立刻啟動 daemon，並設定每次登入時自動啟動。
 
@@ -152,7 +154,7 @@ token 會依序從 `DISCORD_BOT_TOKEN` 環境變數、`~/.claude/channels/discor
 | `/key <按鍵>` | session 頻道 | 在 session 的終端機裡按鍵：`esc enter up down left right tab stab space bs c-c`，或單個字母、數字，最多 12 個，例如 `/key down enter` |
 | `yes abcde` / `no abcde` | session 頻道 | 用代碼回答權限請求 |
 
-每個指令都可以改用 `!new`、`!stop`、`!sync off` 這種寫法。
+`!new`、`!stop`、`!end`、`!resume`、`!sync`、`!mode`、`!model`、`!rename`、`!handoff`、`!screen`、`!key` 也可以直接打成一般訊息，例如 `!sync off`。`/usage`、`/share`、`/unshare`、`/members` 只能用斜線指令。
 
 ## 分享
 
@@ -160,10 +162,10 @@ session 頻道預設是私人的，只有 bot 和 `allowFrom` 裡的擁有者看
 
 | | 擁有者 | 完整 | 協作 | 觀看 |
 |---|---|---|---|---|
-| 看到頻道和對話 | ✅ | ✅ | ✅ | ✅ |
-| 對 Claude 說話、回答選擇題、`/stop`、`/rename` | ✅ | ✅ | ✅ | |
+| 看到頻道和對話、`/members`、`/usage` | ✅ | ✅ | ✅ | ✅ |
+| 對 Claude 說話、回答選擇題、`/stop`、`/rename`、`/handoff` | ✅ | ✅ | ✅ | |
 | 核准權限請求和計畫 | ✅ | ✅ | | |
-| `/end`、`/share`、`/new`、`/resume`、控制台 | ✅ | | | |
+| `/end`、`/new`、`/resume`、`/share`、`/unshare`、`/sync`、`/mode`、`/model`、控制台 | ✅ | | | |
 
 協作者傳給 Claude 的訊息會標註他們的身分。能對 Claude 說話的人就能叫它在你的電腦上做事，請只分享給你信任的人。分享設定在 `/resume` 之後和封存期間都仍然有效。
 
@@ -254,6 +256,7 @@ session 頻道預設是私人的，只有 bot 和 `allowFrom` 裡的擁有者看
 | `attachOver` | 回覆超過幾個字就改成附檔 |
 | `channels` | `false`（預設）：透過 tmux 和 hook 操作 session，見[不使用 channels](#不使用-channels)。`true`：把 `ccd` 啟動的 session 作為 Claude Code channel 載入（需要 claude.ai 或 Console 登入） |
 | `tmuxInput` | tmux 裡的哪些 session 接受 Discord 訊息輸入：`"all"`（預設，普通 `claude` 也算）、`"ccd"` 或 `"off"` |
+| `updateCheck` | 每天檢查一次 GitHub 有沒有新版本；有的話會在控制台 @ 你通知一次，並一直顯示在最上面直到更新。`false` 關閉 |
 
 環境變數 `DISCORD_SYNC_ASK_TIMEOUT`（秒，預設 600）決定選擇題或計畫在 Discord 上等多久，逾時就回到終端機作答。
 

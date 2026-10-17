@@ -71,6 +71,8 @@ export type Config = {
    * `"channels": true`), "off".
    */
   tmuxInput: 'all' | 'ccd' | 'off'
+  /** Check GitHub once a day for a newer release and say so in the console. */
+  updateCheck: boolean
 }
 
 function readEnvFile(path: string): Record<string, string> {
@@ -138,5 +140,6 @@ export function loadConfig(): Config {
     channels: file.channels ?? false,
     // With channels, plain `claude` sessions stay read-only unless asked for, as before.
     tmuxInput: file.tmuxInput === 'all' || file.tmuxInput === 'ccd' || file.tmuxInput === 'off' ? file.tmuxInput : file.channels ? 'ccd' : 'all',
+    updateCheck: file.updateCheck ?? true,
   }
 }

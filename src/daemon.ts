@@ -54,6 +54,8 @@ import { readSnapshot, tokens, type PlanLimit } from './usage'
 import { IS_WIN, IS_LINUX, hasTmux, parentPid } from './platform'
 import { COMPILED, selfCommand } from './self'
 import { daemonRunning } from './autostart'
+import { latestRelease, isNewer } from './release'
+import { VERSION } from './version'
 import { keysToTmux, type Key } from './keys'
 import { cardEmbed, toolPreview, type Card, type CardState } from './cards'
 import { discordify } from './markdown'
@@ -138,6 +140,8 @@ type State = {
   consoleMessageId?: string
   /** Left over from the removed multi-machine mode; deleted at startup. */
   devicesChannelId?: string
+  /** The newest release the console has announced, so each is announced once. */
+  updateNotified?: string
   sessions: Record<string, SessionState>
 }
 
@@ -1787,12 +1791,20 @@ const STARTUP_PROMPTS: { re: RegExp; accept?: RegExp }[] = [
   { re: /Bypass Permissions mode/i, accept: /Yes, I accept/i },
 ]
 
-/** Keys to press for a startup dialog: Enter if the cursor is on the accepting option, else Down. */
-function dialogKey(screen: string, accept: RegExp | undefined): 'Enter' | 'Down' {
+/**
+ * Key to press for a startup dialog: Enter if the cursor is on the accepting option, else Down.
+ * Undefined while the cursor isn't on screen yet, so Enter never lands on a "No, exit" default.
+ * The cursor is ❯, or > in a Windows console.
+ */
+function dialogKey(screen: string, accept: RegExp | undefined): 'Enter' | 'Down' | undefined {
   if (!accept) return 'Enter'
-  const cursor = screen.split('\n').find(l => /^\s*❯/.test(l))
-  return !cursor || accept.test(cursor) ? 'Enter' : 'Down'
+  const cursor = cursorLine(screen)
+  if (!cursor) return undefined
+  return accept.test(cursor) ? 'Enter' : 'Down'
 }
+
+/** The dialog cursor's line; the last one, since a console may still show the frame before a redraw above it. */
+const cursorLine = (screen: string) => screen.split('\n').filter(l => /^\s*[❯>]\s/.test(l)).pop()
 
 const expandHome = (p: string) => p.replace(/^~(?=\/|$)/, homedir())
 
@@ -1826,7 +1838,7 @@ type Launch = {
   hint: string
   /** The current screen, plus `dead` (exit status) once the process is gone; undefined if it vanished. */
   poll(): Promise<{ screen: string; dead?: string } | undefined>
-  press(key: 'Enter' | 'Down'): Promise<unknown>
+  press(key: Key): Promise<unknown>
   owns(t: Tracked): boolean
   registered(): Promise<unknown>
 }
@@ -1863,7 +1875,7 @@ async function startInTmux(dir: string, args: string[]): Promise<Launch> {
         return undefined
       }
     },
-    press: key => run('tmux', ['send-keys', '-t', name, key]),
+    press: key => Promise.all(keysToTmux([key]).map(k => run('tmux', ['send-keys', '-t', name, ...k]))),
     owns: t => !!t.live && (t.live.pid === panePid || parentPid(t.live.pid) === panePid),
     registered: () => run('tmux', ['set-option', '-t', name, 'remain-on-exit', 'off']).catch(() => {}),
   }
@@ -1931,14 +1943,16 @@ async function launchSession(r: Replier, dir: string, args: string[], resumeId?:
     if (p.dead !== undefined) return void (await status.edit(m.startFailed(p.dead, screenBlock(screen))))
     const prompt = STARTUP_PROMPTS.find(p => p.re.test(screen) && !answered.has(p.re))
     if (prompt) {
-      const key = downs < 5 ? dialogKey(screen, prompt.accept) : 'Enter'
+      const key = dialogKey(screen, prompt.accept)
       if (key === 'Enter') {
         answered.add(prompt.re)
         downs = 0
-      } else {
+        await l.press('Enter')
+      } else if (key === 'Down' && downs < 6) {
+        // Never Enter on a declining option: if the cursor won't move, wait out the timeout and show the screen.
         downs++
+        await l.press('Down')
       }
-      await l.press(key)
     }
   }
   await status.edit(m.startTimeout(NEW_TIMEOUT_MS / 1000, screenBlock(screen)))
@@ -2320,6 +2334,7 @@ function consoleView() {
   const lines = [
     '## 🖥️ Claude Sessions',
     ...(planLine ? [`📊 ${planLine}`] : []),
+    ...(newerRelease ? [m.updateLine(newerRelease.tag)] : []),
     ...(state.pausedAll ? [m.allPausedBanner] : []),
     live.length ? `${m.running} · ${live.length}` : m.running,
   ]
@@ -3297,6 +3312,29 @@ async function setSync(r: Replier, channelId: string, on: boolean, by: string) {
   }
 }
 
+// ---- Update notice ------------------------------------------------------------
+// Once a day, ask GitHub for the latest release. A newer one is announced once
+// in the console (with an @-mention) and stays listed at the top until updated.
+
+const UPDATE_CHECK_EVERY_MS = 24 * 3_600_000
+let newerRelease: { tag: string; url: string } | undefined
+
+async function checkForUpdate() {
+  const latest = await latestRelease()
+  if (!latest) return
+  newerRelease = isNewer(latest.tag, VERSION) ? latest : undefined
+  if (!newerRelease || state.updateNotified === latest.tag) return
+  const ch = await consoleChannel()
+  if (!ch) return
+  const how = COMPILED ? m.updateHowBinary : m.updateHowSource
+  await ch.send({
+    content: `${mentionsOf(cfg.allowFrom)}\n${m.updateAvailable(latest.tag, VERSION, latest.url)}\n${how}`,
+    allowedMentions: { users: cfg.allowFrom },
+  })
+  state.updateNotified = latest.tag
+  stateDirty = true
+}
+
 // ---- /share, /unshare, /members, /sync -------------------------------------------
 
 const SESSION_COMMANDS = ['share', 'unshare', 'members', 'sync', 'model', 'mode', 'rename', 'handoff', 'usage', 'screen', 'key'] as const
@@ -3695,6 +3733,11 @@ client.once('clientReady', async c => {
   startIpc()
   setInterval(() => void tick(), TICK_MS)
   void tick()
+  if (cfg.updateCheck) {
+    const check = () => void checkForUpdate().catch(e => log('update check failed:', e?.message ?? e))
+    setTimeout(check, 60_000)
+    setInterval(check, UPDATE_CHECK_EVERY_MS)
+  }
 })
 
 client.on('error', e => log('client error:', e.message))

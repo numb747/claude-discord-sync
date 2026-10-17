@@ -39,6 +39,7 @@ The Discord-facing text is available in English, Traditional Chinese and Simplif
 - **Archive.** Ended sessions keep their channel, meeting threads included, and move to an archive category (`Claude Sessions (ended)`, then `…-2`, `…-3` as each fills its 50 channels). `/resume` moves a channel back.
 - **Cleanup.** Only when the server nears Discord's 500-channel limit are the channels of the sessions that ended longest ago deleted (the console says which); their transcripts and meeting records stay on your computer. A time limit is optional.
 - **Several computers, one bot.** Each computer uses its own server; see [Several computers](#several-computers-one-bot).
+- **Update notice.** When a new release is out, the console says so (see `updateCheck`); updating stays up to you.
 
 ## Requirements
 
@@ -52,7 +53,8 @@ The Discord-facing text is available in English, Traditional Chinese and Simplif
 | | Linux | macOS | Windows |
 |---|---|---|---|
 | Mirroring, chat, questions, plans, permissions, console, archive | ✅ | ✅ | ✅ |
-| `/stop`, `/end` | tmux, or `TIOCSTI` | tmux, or `TIOCSTI` via the system Perl | types into the session's console (**experimental**) |
+| `/stop`, `/end`, `/model`, `/rename` (typed into the session) | tmux, or `TIOCSTI` | tmux, or `TIOCSTI` via the system Perl | types into the session's console (**experimental**) |
+| `/mode` (reads the session's screen) | tmux only | tmux only | the session's console (**experimental**) |
 | `/new`, `/resume` | tmux | tmux | opens a new console window (**experimental**) |
 | Daemon at login (set up by `setup`) | systemd user unit | launchd agent | Startup folder |
 
@@ -74,11 +76,11 @@ curl -fsSL https://raw.githubusercontent.com/Cnyn0403/claude-discord-sync/master
 irm https://raw.githubusercontent.com/Cnyn0403/claude-discord-sync/master/install.ps1 | iex
 ```
 
-The installer downloads a single executable for your platform (no Bun or Node needed), checks its SHA-256 against the release, and starts `claude-discord-sync setup`, which:
+The installer downloads a single executable for your platform (no Bun or Node needed), checks its SHA-256 against the release, and starts `claude-discord-sync setup`, which asks for the language and then:
 
 1. Walks you through creating the bot, then asks for its token (hidden while you type) and checks it with Discord, including **Message Content Intent**.
 2. Prints an invite link and waits for the bot to join your server.
-3. Asks for your Discord user ID (only you can control sessions) and the language.
+3. Asks for your Discord user ID (only you can control sessions).
 4. Installs the `ccd` command.
 5. Starts the daemon now and at every login.
 
@@ -152,7 +154,7 @@ Which sessions accept input is set by `tmuxInput`: every session running in tmux
 | `/key <keys>` | session channel | Press keys in the session's terminal: `esc enter up down left right tab stab space bs c-c`, or a single letter or digit, up to 12, e.g. `/key down enter` |
 | `yes abcde` / `no abcde` | session channel | Answer a permission prompt by its code |
 
-Each command also works as `!new`, `!stop`, `!sync off`, and so on.
+`!new`, `!stop`, `!end`, `!resume`, `!sync`, `!mode`, `!model`, `!rename`, `!handoff`, `!screen` and `!key` also work as plain messages, e.g. `!sync off`. `/usage`, `/share`, `/unshare` and `/members` are slash commands only.
 
 ## Sharing
 
@@ -160,10 +162,10 @@ Session channels are private: only the bot and the owners in `allowFrom` can see
 
 | | Owner | Full | Collaborate | View |
 |---|---|---|---|---|
-| See the channel and conversation | ✅ | ✅ | ✅ | ✅ |
-| Talk to Claude, answer questions, `/stop`, `/rename` | ✅ | ✅ | ✅ | |
+| See the channel and conversation, `/members`, `/usage` | ✅ | ✅ | ✅ | ✅ |
+| Talk to Claude, answer questions, `/stop`, `/rename`, `/handoff` | ✅ | ✅ | ✅ | |
 | Approve permission prompts and plans | ✅ | ✅ | | |
-| `/end`, `/share`, `/new`, `/resume`, the console | ✅ | | | |
+| `/end`, `/new`, `/resume`, `/share`, `/unshare`, `/sync`, `/mode`, `/model`, the console | ✅ | | | |
 
 Collaborators' messages reach Claude marked with their role. Anyone who can talk to Claude can make it act on your computer, so share with care. Access is kept across `/resume` and in the archive.
 
@@ -254,6 +256,7 @@ Setup marks servers another computer is already using. A daemon also checks at s
 | `attachOver` | Replies longer than this many characters are attached as `.md` |
 | `channels` | `false` (default): drive sessions through tmux and hooks, see [Without channels](#without-channels). `true`: load `ccd` sessions as a Claude Code channel (needs a claude.ai or Console login) |
 | `tmuxInput` | Which sessions in tmux take Discord messages as typed input: `"all"` (default, plain `claude` too), `"ccd"`, or `"off"` |
+| `updateCheck` | Check GitHub once a day for a new release; the console announces it once with an @-mention and lists it at the top until you update. `false` disables |
 
 Environment variable `DISCORD_SYNC_ASK_TIMEOUT` (seconds, default 600) sets how long a question or plan waits on Discord before falling back to the terminal.
 

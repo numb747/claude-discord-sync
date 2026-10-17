@@ -23,6 +23,8 @@ const loadKernel32 = () => dlopen('kernel32.dll', {
   WriteConsoleInputW: { args: [FFIType.u64, FFIType.ptr, FFIType.u32, FFIType.ptr], returns: FFIType.i32 },
   GetConsoleScreenBufferInfo: { args: [FFIType.u64, FFIType.ptr], returns: FFIType.i32 },
   ReadConsoleOutputCharacterW: { args: [FFIType.u64, FFIType.ptr, FFIType.u32, FFIType.u32, FFIType.ptr], returns: FFIType.i32 },
+  GetConsoleMode: { args: [FFIType.u64, FFIType.ptr], returns: FFIType.i32 },
+  SetConsoleMode: { args: [FFIType.u64, FFIType.u32], returns: FFIType.i32 },
 }).symbols
 const k32 = new Proxy({} as ReturnType<typeof loadKernel32>, { get: (_, k) => (k32Proxy() as any)[k] })
 
@@ -41,19 +43,49 @@ function open(name: 'CONIN$' | 'CONOUT$') {
   return h
 }
 
-function attach(pid: number) {
+function consoleMode(name: 'CONIN$' | 'CONOUT$'): number | undefined {
+  const h = open(name)
+  try {
+    const mode = new Uint32Array(1)
+    return k32.GetConsoleMode(h, ptr(mode)) ? mode[0] : undefined
+  } finally {
+    k32.CloseHandle(h)
+  }
+}
+
+/**
+ * Run `fn` attached to the console of `pid`, then leave it as it was found. Bun
+ * restores the console modes it saw at startup when it exits; still attached,
+ * that switched off the session's escape-sequence processing and its screen
+ * filled with raw codes. So put both modes back and detach before exiting.
+ */
+function withConsole<T>(pid: number, fn: () => T): T {
   k32.FreeConsole()
   if (!k32.AttachConsole(pid)) throw new Error(`AttachConsole(${pid}) failed (${k32.GetLastError()})`)
+  const names = ['CONIN$', 'CONOUT$'] as const
+  const modes = names.map(n => consoleMode(n))
+  try {
+    return fn()
+  } finally {
+    names.forEach((n, i) => {
+      const mode = modes[i]
+      if (mode === undefined || consoleMode(n) === mode) return
+      const h = open(n)
+      k32.SetConsoleMode(h, mode)
+      k32.CloseHandle(h)
+    })
+    k32.FreeConsole()
+  }
 }
 
 /** One INPUT_RECORD (20 bytes) holding a KEY_EVENT_RECORD. */
-function keyRecord(down: boolean, vk: number, char: number, controlState = 0): Buffer {
+function keyRecord(down: boolean, vk: number, char: number, controlState: number, scan: number): Buffer {
   const b = Buffer.alloc(20)
   b.writeUInt16LE(KEY_EVENT, 0)
   b.writeInt32LE(down ? 1 : 0, 4) // bKeyDown
   b.writeUInt16LE(1, 8) // wRepeatCount
   b.writeUInt16LE(vk, 10) // wVirtualKeyCode
-  b.writeUInt16LE(0, 12) // wVirtualScanCode
+  b.writeUInt16LE(scan, 12) // wVirtualScanCode
   b.writeUInt16LE(char, 14) // uChar.UnicodeChar
   b.writeUInt32LE(controlState, 16) // dwControlKeyState
   return b
@@ -61,32 +93,38 @@ function keyRecord(down: boolean, vk: number, char: number, controlState = 0): B
 
 function records(keys: Key[]): Buffer {
   const out: Buffer[] = []
-  const press = (vk: number, char: number, state = 0) => out.push(keyRecord(true, vk, char, state), keyRecord(false, vk, char, state))
+  // Records as a real keyboard makes them, scan codes included: some readers ignore keys without one.
+  const press = (vk: number, char: number, scan = 0, state = 0) =>
+    out.push(keyRecord(true, vk, char, state, scan), keyRecord(false, vk, char, state, scan))
   for (const k of keys) {
-    if (k === 'Escape') press(0x1b, 0x1b)
-    else if (k === 'Enter') press(0x0d, 0x0d)
-    else if (k === 'Down') press(0x28, 0)
-    else if (k === 'BackTab') press(0x09, 0x09, 0x0010) // SHIFT_PRESSED
+    if (k === 'Escape') press(0x1b, 0x1b, 0x01)
+    else if (k === 'Enter') press(0x0d, 0x0d, 0x1c)
+    else if (k === 'Down') press(0x28, 0, 0x50, 0x0100) // ENHANCED_KEY: the arrow key, not numpad 2
+    else if (k === 'BackTab') press(0x09, 0x09, 0x0f, 0x0010) // SHIFT_PRESSED
     else for (const ch of k.text) press(0, ch.charCodeAt(0))
   }
   return Buffer.concat(out)
 }
 
 function typeKeys(pid: number, keys: Key[]) {
-  attach(pid)
-  const h = open('CONIN$')
-  try {
-    const recs = records(keys)
-    const written = new Uint32Array(1)
-    if (!k32.WriteConsoleInputW(h, ptr(recs), recs.length / 20, ptr(written))) throw new Error(`WriteConsoleInputW failed (${k32.GetLastError()})`)
-  } finally {
-    k32.CloseHandle(h)
-  }
+  withConsole(pid, () => {
+    const h = open('CONIN$')
+    try {
+      const recs = records(keys)
+      const written = new Uint32Array(1)
+      if (!k32.WriteConsoleInputW(h, ptr(recs), recs.length / 20, ptr(written))) throw new Error(`WriteConsoleInputW failed (${k32.GetLastError()})`)
+    } finally {
+      k32.CloseHandle(h)
+    }
+  })
 }
 
 /** The visible part of the screen buffer, one line per row. */
 function screen(pid: number): string {
-  attach(pid)
+  return withConsole(pid, () => readScreen())
+}
+
+function readScreen(): string {
   const h = open('CONOUT$')
   try {
     // CONSOLE_SCREEN_BUFFER_INFO: dwSize, dwCursorPosition, wAttributes, srWindow{L,T,R,B}, dwMaximumWindowSize
