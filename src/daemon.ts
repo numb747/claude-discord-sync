@@ -57,7 +57,7 @@ import { daemonRunning } from './autostart'
 import { keysToTmux, type Key } from './keys'
 import { cardEmbed, toolPreview, type Card, type CardState } from './cards'
 import { discordify } from './markdown'
-import { backToLeader, capture, dialogOptions, focusIn, hasPromptBox, leaveCopyMode, parseKeys, pasteAndSubmit, promptIn, screenTail, tmux, type DialogOption, type Pane } from './terminal'
+import { backToLeader, capture, dialogOptions, draftIsMessage, focusIn, hasPromptBox, leaveCopyMode, parseKeys, pasteAndSubmit, promptIn, screenTail, tmux, type DialogOption, type Pane } from './terminal'
 
 const cfg = loadConfig()
 /** Experimental: several computers share this bot and guild; this one's name. */
@@ -984,9 +984,8 @@ function wasTyped(t: Tracked, plain: string): boolean {
 
 /** Whether what's in the input box is the session's last prompt, put back by an interruption. */
 function isPutBack(t: Tracked, draft: string): boolean {
-  const squash = (s: string) => s.replace(/\s+/g, '')
   const last = lastSentPrompt(t.st.transcript)
-  return !!last && squash(last) === squash(draft)
+  return !!last && draftIsMessage(draft, last)
 }
 
 /** One paste at a time per pane, so two quick messages can't interleave. */

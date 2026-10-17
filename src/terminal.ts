@@ -89,6 +89,26 @@ export function promptOf(screenWithColors: string, cursor?: Cursor): { draft: st
   return { draft: draft.trim() }
 }
 
+/** A long paste, collapsed in the box ("[Pasted text #2 +13 lines]"); the transcript has it in full. */
+const PASTED_RE = /\[Pasted text #\d+(?: \+(\d+) lines?)?\]/g
+
+/**
+ * Whether the box's `draft` is the message `sent` put back: the same text give
+ * or take whitespace (the box wraps it), each collapsed paste standing for as
+ * many lines of `sent` as it says.
+ */
+export function draftIsMessage(draft: string, sent: string): boolean {
+  const literal = (s: string) => [...s.replace(/\s+/g, '')].map(c => c.replace(/[.*+?^${}()|[\]\\]/, '\\$&')).join('\\s*')
+  let re = ''
+  let at = 0
+  for (const p of draft.matchAll(PASTED_RE)) {
+    re += `${literal(draft.slice(at, p.index))}\\s*${p[1] ? `(?:[^\\n]*\\n){${p[1]}}[^\\n]*` : '[\\s\\S]+?'}\\s*`
+    at = p.index + p[0].length
+  }
+  re += literal(draft.slice(at))
+  return new RegExp(`^\\s*${re}\\s*$`).test(sent)
+}
+
 /** The live input box's "❯ …" line (the one drawn under a rule), or undefined when no box is drawn. */
 function boxLine(screen: string): string | undefined {
   const plain = stripAnsi(screen).split('\n')

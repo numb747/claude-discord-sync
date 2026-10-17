@@ -1,0 +1,49 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.302[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mOpus 5.5 (1M context) with high effort · API Usage Billing[39m
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m~/claude-discord-sync[39m
+
+
+[38;5;246m[48;5;237m❯ [38;5;231mreply with just the word ok[39m
+
+[38;5;231m[49m●[39m ok
+
+[38;5;246m✻[39m [38;5;246mBrewed for 6s · done 6:39 PM[39m
+
+[38;5;246m[48;5;237m❯ [38;5;231mrun [38;5;153msleep 20[38;5;231m in bash, then reply with just done[39m
+[49m
+  [38;5;246mRan [1m1[0m[38;5;246m shell command [39m
+
+[38;5;246m[48;5;237m❯ [38;5;231mafter that, reply with the word two[39m
+
+[38;5;231m[49m●[39m Still waiting on the 20-second sleep. Once it finishes, I'll reply "done" and then "two".
+
+[38;5;246m✻[39m [38;5;246mCrunched for 22s · done 6:40 PM[39m
+
+[38;5;114m●[39m Background command "Wait 20 seconds" completed (exit code 0)
+
+[38;5;231m●[39m done
+
+  two
+
+[38;5;246m✻[39m [38;5;246mSautéed for 4s · done 6:40 PM[39m
+
+[38;5;246m[48;5;237m❯ [38;5;231mreply with a 300 word essay about rivers, no tools[39m
+[38;5;246m[49m  ⎿  Interrupted · What should Claude do instead?[39m
+
+[38;5;246m[48;5;237m❯ [38;5;231mthen reply with the word three[39m
+
+[38;5;231m[49m●[39m three
+
+[38;5;246m✻[39m [38;5;246mBaked for 5s · done 6:41 PM[39m
+
+
+
+
+
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [Pasted text #4 +13 lines]
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m   [2m[38;5;246m[Opus 5.5 (1M context)·high][0m[38;5;246m [36mclaude-discord-sync[38;5;246m [35m⎇ master[38;5;246m │ [32m░░░░░░░░░░ 7%[38;5;246m [2m65k/1000k[0m[38;5;246m [2m$0.15[0m
+  [38;5;211m⏵⏵ bypass permissions on[38;5;246m (shift+tab to cycle)[39m

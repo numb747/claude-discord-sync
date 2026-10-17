@@ -108,6 +108,14 @@ describe('renderRecord', () => {
     )
     expect(blocks).toEqual([{ kind: 'info', text: '-# ⏹️ Interrupted' }])
   })
+  test('a long paste is shown as the text pasted, so a message typed from Discord is recognised', () => {
+    const { renderRecord } = require('../src/render')
+    const blocks = renderRecord(
+      { type: 'user', message: { content: 'read this\n\n<pasted_content id="1866">\nline 1\nline 2\n</pasted_content id="1866">' } },
+      { toolNames: new Map(), showToolCalls: true },
+    )
+    expect(blocks[0].plain).toBe('read this\n\nline 1\nline 2')
+  })
 })
 
 describe('lastSentPrompt', () => {

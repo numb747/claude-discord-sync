@@ -1,12 +1,13 @@
 /**
  * Screen parsing against real Claude Code 2.1.273 screens captured from tmux
  * (fixtures/*.txt plain, *.ansi with `capture-pane -e`), and 2.1.299 screens
- * (*-cursor.ansi) with tmux's cursor position. Run with `bun test`.
+ * (*-cursor.ansi) with tmux's cursor position; pasted-cursor.ansi is 2.1.302.
+ * Run with `bun test`.
  */
 import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'fs'
 import { join } from 'path'
-import { agentList, dialogOptions, hasPromptBox, keyBackToLeader, onAgentView, parseKeys, promptOf, screenTail } from '../src/terminal'
+import { agentList, dialogOptions, draftIsMessage, hasPromptBox, keyBackToLeader, onAgentView, parseKeys, promptOf, screenTail } from '../src/terminal'
 
 const fx = (name: string) => readFileSync(join(import.meta.dir, 'fixtures', name), 'utf8')
 
@@ -51,6 +52,30 @@ describe('promptOf', () => {
       draft:
         '请帮我写一个很长的故事，主题是星际旅行，要求：\n1. 至少五千字\n2. 有三个主要角色，每个角色都要有完整的背景故事和性格描写，并且角色之间要有冲突和和解的过程，结尾要出人意料但是合理',
     })
+  })
+  test('2.1.302: a long paste put back after an interruption is collapsed', () => {
+    expect(promptOf(fx('pasted-cursor.ansi'), { x: 28, y: 45 })).toEqual({ draft: '[Pasted text #4 +13 lines]' })
+  })
+})
+
+describe('draftIsMessage', () => {
+  const notes = ['[Discord · alice (collaborator)] please read these notes', ...Array.from({ length: 12 }, (_, i) => `note ${i + 1}`), 'then write a poem'].join('\n')
+  test('the same text, wrapped differently', () => {
+    expect(draftIsMessage('写一首关于 河流的诗', '写一首关于河流的\n诗')).toBe(true)
+    expect(draftIsMessage('写一首关于河流的诗', '写一首关于山的诗')).toBe(false)
+  })
+  test('a collapsed paste stands for as many lines as it says', () => {
+    expect(draftIsMessage('[Pasted text #4 +13 lines]', notes)).toBe(true)
+    expect(draftIsMessage('[Pasted text #4 +12 lines]', notes)).toBe(false)
+    expect(draftIsMessage('[Pasted text #4 +13 lines]', 'short')).toBe(false)
+  })
+  test('text typed around a paste has to match too', () => {
+    expect(draftIsMessage('read this[Pasted text #2 +13 lines]', `read this\n\n${notes}`)).toBe(true)
+    expect(draftIsMessage('read that[Pasted text #2 +13 lines]', `read this\n\n${notes}`)).toBe(false)
+  })
+  test('regex characters in the draft are literal', () => {
+    expect(draftIsMessage('a.b (c) [d]', 'a.b (c) [d]')).toBe(true)
+    expect(draftIsMessage('a.b', 'axb')).toBe(false)
   })
 })
 

@@ -32,6 +32,8 @@ function stripNoise(s: string): string {
   return s
     .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
     .replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>/g, '')
+    // A long paste (every long message typed in from Discord) is recorded wrapped in these.
+    .replace(/<pasted_content id="[^"]*">\n?([\s\S]*?)\n?<\/pasted_content id="[^"]*">/g, '$1')
     .trim()
 }
 
