@@ -183,11 +183,14 @@ The mirror also rewrites Markdown that Discord can't show. Tables become lists, 
 
 ## The console and channels
 
-The **console** (`#claude-console`) lists every session with its status, with menus and buttons below. Three of them act on running sessions at once, so each first asks in a message only you can see; the red button goes ahead, "Cancel" changes nothing:
+The **console** (`#claude-console`) lists every session with its status, with menus and buttons below. A line shows the status, the channel (whose name already says the folder and the title) and context use; the panel lists the last 5 ended sessions, the resume menu up to 25.
+
+Anything that acts on running sessions takes a second tap in a message only you can see; "Cancel" changes nothing:
 
 - **Pause all**: pauses sync for every session. Claude keeps working, but nothing from the paused stretch is posted, then or after resuming; permission prompts stay in the terminal; messages sent in the channels are refused. "Resume all" brings it back and doesn't ask.
-- **Interrupt a working session**: the same as Esc in the terminal; the session stays open.
-- **End a session**: interrupts it if it's working, then types `/exit`. It can be resumed later.
+- **Interrupt / end / pause a session**: pick the session, then a button: **Interrupt** (only while it's working) is the same as Esc in the terminal, the session stays open; **End** interrupts it if it's working, then types `/exit`, and it can be resumed later; **Pause sync / Resume sync** is the same as `/sync off` / `/sync on` in its channel.
+
+The panel is kept the only message in the console. A `/new` or `!new` that started its session is deleted after 20 seconds (the panel lists the new channel); one that failed stays, with the screen that says why. Anything else typed in the console gets a reply pointing to the session channels, and both are deleted after a minute.
 
 **Deleting a channel on Discord does not delete the Claude Code session.** The transcript lives on the computer under `~/.claude/projects/`; the channel is only a mirror. What deleting does:
 

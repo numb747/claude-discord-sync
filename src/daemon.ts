@@ -877,6 +877,12 @@ client.on('messageCreate', async (msg: Message) => {
     await runCommand(messageReplier(msg), msg.channelId, cmd[1].toLowerCase() as Command, dir || undefined, prompt.join(' ') || undefined)
     return
   }
+  // Nothing reads the console, so a message here was almost always meant for a session's channel.
+  if (msg.channelId === state.consoleChannelId) {
+    const hint = await msg.reply({ content: m.consoleNotChat(CONSOLE_STRAY_MS / 1000), allowedMentions: { parse: [] } }).catch(() => undefined)
+    setTimeout(() => void Promise.all([hint?.delete(), msg.delete()]).catch(() => {}), CONSOLE_STRAY_MS)
+    return
+  }
   const meeting = meetingByThread(msg.channelId)
   if (meeting) return void (await onMeetingMessage(meeting, msg).catch(e => log('meeting message failed:', e?.message ?? e)))
   const t = trackedByChannel(msg.channelId)
@@ -1764,6 +1770,10 @@ const run = promisify(execFile)
  */
 const CCD_TMUX = COMPILED ? selfCommand('ccd') : [resolve(import.meta.dir, '..', 'bin', 'ccd')]
 const NEW_TIMEOUT_MS = 45_000
+/** Only when the daemon itself runs under systemd (INVOCATION_ID is set for units). */
+const SYSTEMD_RUN = IS_LINUX && process.env.INVOCATION_ID ? Bun.which('systemd-run') : null
+/** Whether tmux already has this session, so a failed start isn't tried a second time after it got that far. */
+const tmuxHas = (name: string) => run('tmux', ['has-session', '-t', `=${name}`]).then(() => true, () => false)
 const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`
 
 /**
@@ -1827,10 +1837,18 @@ async function startInTmux(dir: string, args: string[]): Promise<Launch> {
   const name = `ccd-${Math.random().toString(36).slice(2, 6)}`
   const cmd = ['exec', ...CCD_TMUX.map(shq), ...args.map(shq)].join(' ')
   // remain-on-exit keeps the screen around if it dies during startup, so we can show why.
-  const { stdout } = await run('tmux', [
+  const tmuxArgs = [
     'new-session', '-d', '-P', '-F', '#{pane_pid}', '-s', name, '-x', '200', '-y', '50', '-c', dir, cmd,
     ';', 'set-option', '-t', name, 'remain-on-exit', 'on',
-  ])
+  ]
+  // If this starts the tmux server, it would be in the daemon's systemd unit, and restarting
+  // the daemon would kill it with every session in it. A scope of its own keeps it out.
+  // Failing that (a system unit has no user manager), a session that dies with the daemon beats none.
+  const { stdout } = SYSTEMD_RUN
+    ? await run(SYSTEMD_RUN, ['--user', '--scope', '--quiet', '--collect', `--unit=${name}-${Date.now().toString(36)}`, 'tmux', ...tmuxArgs]).catch(e =>
+        tmuxHas(name).then(has => (has ? Promise.reject(e) : run('tmux', tmuxArgs))),
+      )
+    : await run('tmux', tmuxArgs)
   const panePid = Number(stdout.trim())
   return {
     name: `tmux \`${name}\``,
@@ -1904,6 +1922,8 @@ async function launchSession(r: Replier, dir: string, args: string[], resumeId?:
     if (t?.st.channelId) {
       await l.registered()
       await status.edit(m.started(l.name, t.st.channelId, l.hint))
+      // The console lists the new session too; failures above stay, since their screen explains what went wrong.
+      tidyConsole(r, status)
       return t
     }
     const p = await l.poll()
@@ -2089,18 +2109,27 @@ const COMMANDS = ['new', 'stop', 'end', 'resume'] as const
 type Command = (typeof COMMANDS)[number]
 
 /** Where a command's status messages go. `reply` returns a handle to edit that message later. */
+type Reply = {
+  edit(text: string): Promise<unknown>
+  /** Delete the reply, and the typed command it answers if there is one. */
+  dismiss(): Promise<unknown>
+}
+
 type Replier = {
-  reply(text: string): Promise<{ edit(text: string): Promise<unknown> }>
+  reply(text: string): Promise<Reply>
   react(emoji: string): void
+  /** Replies are posted in the console for everyone to see, so ones nobody needs to keep should be tidied away. */
+  inConsole: boolean
 }
 
 function messageReplier(msg: Message): Replier {
   return {
     reply: async text => {
       const sent = await msg.reply(text)
-      return { edit: t => sent.edit(t) }
+      return { edit: t => sent.edit(t), dismiss: () => Promise.all([sent.delete(), msg.delete()]) }
     },
     react: emoji => void msg.react(emoji).catch(() => {}),
+    inConsole: msg.channelId === state.consoleChannelId,
   }
 }
 
@@ -2112,13 +2141,24 @@ function interactionReplier(i: RepliableInteraction, ephemeral = false): Replier
       if (first) {
         first = false
         await i.editReply(text)
-        return { edit: t => i.editReply(t) }
+        return { edit: t => i.editReply(t), dismiss: () => i.deleteReply() }
       }
       const sent = await i.followUp({ content: text, ...(ephemeral ? { flags: MessageFlags.Ephemeral } : {}) })
-      return { edit: t => i.webhook.editMessage(sent, { content: t }) }
+      return { edit: t => i.webhook.editMessage(sent, { content: t }), dismiss: () => i.deleteReply(sent) }
     },
     react: () => {},
+    inConsole: !ephemeral && i.channelId === state.consoleChannelId,
   }
+}
+
+/** How long a reply that needs no keeping stays in the console: long enough to tap the new channel's link. */
+const CONSOLE_TIDY_MS = 20_000
+/** A message typed in the console is deleted too, so leave time to copy it before it goes. */
+const CONSOLE_STRAY_MS = 60_000
+
+/** The console keeps only its status message: a reply nobody needs to keep goes after a while. */
+function tidyConsole(r: Replier, reply: Reply) {
+  if (r.inConsole) setTimeout(() => void reply.dismiss().catch(() => {}), CONSOLE_TIDY_MS)
 }
 
 function endedByChannel(channelId: string): [string, SessionState] | undefined {
@@ -2256,7 +2296,9 @@ function ago(ms: number | undefined): string {
 const sessionTopic = (st: SessionState) => st.title || (st.lastPrompt ? `「${st.lastPrompt}」` : '')
 
 function sessionOption(sid: string, st: SessionState) {
-  const label = [channelLabel(st), sessionTopic(st)].filter(Boolean).join(' · ')
+  // A titled session's channel name already carries the title.
+  const ch = channelLabel(st)
+  const label = [ch, st.title && ch.startsWith('#') ? '' : sessionTopic(st)].filter(Boolean).join(' · ')
   const description = [st.ended ? m.endedAgo(ago(st.endedAt)) : '', st.cwd].filter(Boolean).join(' · ')
   return { label: clip(label, 100), description: clip(description, 100), value: sid }
 }
@@ -2269,23 +2311,33 @@ function recentEnded(n: number): [string, SessionState][] {
     .slice(0, n)
 }
 
+/** The resume menu lists up to 25; the panel itself only the latest few. */
+const CONSOLE_ENDED_SHOWN = 5
+
 function consoleView() {
   const live = [...tracked.values()].filter(t => t.live)
   const ended = recentEnded(25)
   const planLine = planSummary(5)
-  const lines = ['## 🖥️ Claude Sessions', ...(planLine ? [`📊 ${planLine}`] : []), ...(state.pausedAll ? [m.allPausedBanner] : []), m.running]
+  const lines = [
+    '## 🖥️ Claude Sessions',
+    ...(planLine ? [`📊 ${planLine}`] : []),
+    ...(state.pausedAll ? [m.allPausedBanner] : []),
+    live.length ? `${m.running} · ${live.length}` : m.running,
+  ]
   if (!live.length) lines.push(m.none)
+  // The channel name already says the folder and the title, so a line only adds what it doesn't.
   for (const t of live) {
-    const topic = sessionTopic(t.st)
     const ctx = isPaused(t.st) ? '' : contextLabel(contextOf(t), 5)
-    lines.push(`${isPaused(t.st) ? m.pausedTag + ' ' : ''}${statusIcon(t.live!.status)} · <#${t.st.channelId}>${ctx ? ` · ${ctx}` : ''} · \`${t.st.cwd}\`${topic ? ` · ${clip(topic, 60)}` : ''}`)
+    const prompt = t.st.title ? '' : sessionTopic(t.st)
+    lines.push(`${isPaused(t.st) ? m.pausedTag + ' ' : ''}${statusIcon(t.live!.status)} · <#${t.st.channelId}>${ctx ? ` · ${ctx}` : ''}${prompt ? ` · ${clip(prompt, 40)}` : ''}`)
   }
   lines.push('', m.recentlyEnded)
   if (!ended.length) lines.push(m.none)
-  for (const [, st] of ended.slice(0, 10)) {
-    const topic = sessionTopic(st)
-    lines.push(`⚫ <#${st.channelId}> · ${ago(st.endedAt)} · \`${st.cwd}\`${topic ? ` · ${clip(topic, 60)}` : ''}`)
+  for (const [, st] of ended.slice(0, CONSOLE_ENDED_SHOWN)) {
+    const prompt = st.title ? '' : sessionTopic(st)
+    lines.push(`⚫ <#${st.channelId}> · ${ago(st.endedAt)}${prompt ? ` · ${clip(prompt, 40)}` : ''}`)
   }
+  if (ended.length > CONSOLE_ENDED_SHOWN) lines.push(m.moreInMenu)
 
   const menu = (id: string, placeholder: string, items: [string, SessionState][]) =>
     new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
@@ -2294,27 +2346,10 @@ function consoleView() {
         .setPlaceholder(placeholder)
         .addOptions(items.slice(0, 25).map(([sid, st]) => sessionOption(sid, st))),
     )
-  const busy = live.filter(t => t.live!.status === 'busy').map(t => [t.sessionId, t.st] as [string, SessionState])
   const components: ActionRowBuilder<MessageActionRowComponentBuilder>[] = []
-  if (busy.length) components.push(menu('console:stop', m.stopMenu, busy))
-  if (live.length) components.push(menu('console:end', m.endMenu, live.map(t => [t.sessionId, t.st])))
+  // Interrupting, ending and pausing one session start from the same menu, so it stays two menus however many are running.
+  if (live.length) components.push(menu('console:manage', m.manageMenu, live.map(t => [t.sessionId, t.st])))
   if (ended.length) components.push(menu('console:resume', m.resumeMenu, ended))
-  // One session at a time; while everything is paused only "resume all" makes sense.
-  if (live.length && !state.pausedAll) {
-    components.push(
-      new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
-        new StringSelectMenuBuilder()
-          .setCustomId('console:pause')
-          .setPlaceholder(m.pauseMenu)
-          .addOptions(
-            live.slice(0, 25).map(t => {
-              const o = sessionOption(t.sessionId, t.st)
-              return { ...o, label: clip(`${t.st.paused ? '▶️' : '⏸️'} ${o.label}`, 100) }
-            }),
-          ),
-      ),
-    )
-  }
   const buttons = new ActionRowBuilder<MessageActionRowComponentBuilder>().addComponents(
     new ButtonBuilder().setCustomId('console:new').setLabel(m.newSession).setEmoji('🆕').setStyle(ButtonStyle.Primary),
     state.pausedAll
@@ -2406,12 +2441,32 @@ async function handleConsoleInteraction(i: ButtonInteraction | StringSelectMenuI
   }
   // Pausing everything, interrupting and ending sit one stray tap away on a phone: ask first.
   if (i.isButton() && i.customId === 'console:pauseall') return void (await askConsoleConfirm(i, 'pauseall', m.confirmPauseAll, m.yesPauseAll))
-  if (i.isStringSelectMenu() && (i.customId === 'console:stop' || i.customId === 'console:end')) {
+  // Picking a session from the menu is the stray tap; the card's buttons are the deliberate second one.
+  if (i.isStringSelectMenu() && i.customId === 'console:manage') {
     consoleRendered = '' // Reset the menu's selection on the next tick.
-    const st = state.sessions[i.values[0]]
-    if (!st) return void (await i.reply({ content: m.sessionNotFound, flags: MessageFlags.Ephemeral }))
-    const stop = i.customId === 'console:stop'
-    await askConsoleConfirm(i, `${stop ? 'stop' : 'end'}:${i.values[0]}`, stop ? m.confirmStop(st.channelId) : m.confirmEnd(st.channelId), stop ? m.yesStop : m.yesEnd)
+    const t = tracked.get(i.values[0])
+    if (!t?.live) return void (await i.reply({ content: m.sessionNotFound, flags: MessageFlags.Ephemeral }))
+    const sid = t.sessionId
+    const row = new ActionRowBuilder<MessageActionRowComponentBuilder>()
+    if (t.live.status === 'busy') row.addComponents(new ButtonBuilder().setCustomId(`console:yes:stop:${sid}`).setLabel(m.yesStop).setEmoji('⏹️').setStyle(ButtonStyle.Danger))
+    row.addComponents(new ButtonBuilder().setCustomId(`console:yes:end:${sid}`).setLabel(m.yesEnd).setEmoji('👋').setStyle(ButtonStyle.Danger))
+    // While everything is paused only "resume all" makes sense.
+    if (!state.pausedAll) {
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`console:yes:pause:${sid}`)
+          .setLabel(t.st.paused ? m.resumeSync : m.pauseSync)
+          .setEmoji(t.st.paused ? '▶️' : '⏸️')
+          .setStyle(ButtonStyle.Secondary),
+      )
+    }
+    row.addComponents(new ButtonBuilder().setCustomId('console:cancel').setLabel(m.cancel).setStyle(ButtonStyle.Secondary))
+    await i.reply({
+      content: m.manageCard(t.st.channelId, statusIcon(t.live.status), t.st.cwd),
+      components: [row],
+      flags: MessageFlags.Ephemeral,
+      allowedMentions: { parse: [] },
+    })
     return
   }
   if (i.isButton() && i.customId === 'console:cancel') return void (await i.update({ content: m.cancelled, components: [] }))
@@ -2424,6 +2479,13 @@ async function handleConsoleInteraction(i: ButtonInteraction | StringSelectMenuI
       await setAllPaused(true, i.user.username)
       return void (await r.reply(m.allPaused))
     }
+    if (what === 'pause') {
+      const t = tracked.get(sid)
+      if (!t) return void (await r.reply(m.sessionNotFound))
+      await setSessionPaused(t, !t.st.paused, i.user.username)
+      consoleRendered = ''
+      return void (await r.reply(t.st.paused ? m.sessionPaused(t.st.channelId) : m.sessionResumed(t.st.channelId)))
+    }
     const st = state.sessions[sid]
     if (!st) return void (await r.reply(m.sessionNotFound))
     await runCommand(r, st.channelId, what as Command)
@@ -2434,14 +2496,6 @@ async function handleConsoleInteraction(i: ButtonInteraction | StringSelectMenuI
   if (i.isButton() && i.customId === 'console:resumeall') {
     await setAllPaused(false, i.user.username)
     await r.reply(m.allResumed)
-    return
-  }
-  if (i.isStringSelectMenu() && i.customId === 'console:pause') {
-    const t = tracked.get(i.values[0])
-    if (!t) return void (await r.reply(m.sessionNotFound))
-    await setSessionPaused(t, !t.st.paused, i.user.username)
-    await r.reply(t.st.paused ? m.sessionPaused(t.st.channelId) : m.sessionResumed(t.st.channelId))
-    consoleRendered = ''
     return
   }
   if (i.isModalSubmit()) {
